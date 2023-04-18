@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          components: rustfmt
+          toolchain: nightly-2022-11-03
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          cargo test
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          components: clippy
+          toolchain: nightly-2022-11-03
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: >
+          scripts/clippy.sh
+
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          components: rustfmt
+          toolchain: nightly-2022-11-03
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: scripts/rust_fmt.sh --check
+
+  # Check for unnecessary dependencies.
+  udeps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        name: "Rust Toolchain Setup"
+        with:
+          profile: minimal
+          toolchain: nightly-2022-11-03
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: cache-cargo-udeps
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo-udeps-cache
+          key: cargo-udeps-v0.1.35-${{ runner.os }}
+      - name: "Download and run cargo-udeps"
+        run: |
+          if [ ! -f ~/.cargo-udeps-cache/cargo-udeps ]; then
+            wget -O - -c https://github.com/est31/cargo-udeps/releases/download/v0.1.35/cargo-udeps-v0.1.35-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+            mkdir -p ~/.cargo-udeps-cache
+            mv cargo-udeps-*/cargo-udeps ~/.cargo-udeps-cache/cargo-udeps
+          fi
+          ~/.cargo-udeps-cache/cargo-udeps udeps
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2022-11-03
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2022-11-03
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: >
+          scripts/docs.sh
