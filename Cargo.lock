@@ -1515,6 +1515,7 @@ dependencies = [
 name = "katana-rpc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assert_matches",
  "blockifier",
  "hex",
