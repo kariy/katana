@@ -1494,6 +1494,7 @@ dependencies = [
  "katana-core",
  "katana-rpc",
  "log",
+ "starknet_api",
  "tokio",
 ]
 
