@@ -1504,6 +1504,7 @@ dependencies = [
  "anyhow",
  "blockifier",
  "futures",
+ "serde_json",
  "starknet_api",
  "thiserror",
  "tracing",
