@@ -1514,11 +1514,15 @@ name = "katana-rpc"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "blockifier",
+ "hex",
  "jsonrpsee",
  "katana-core",
  "serde",
  "starknet",
+ "starknet_api",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
