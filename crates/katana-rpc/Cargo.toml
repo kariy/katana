@@ -13,6 +13,7 @@ hex = { version = "0.4.3", default-features = false }
 jsonrpsee = { version = "0.16.2", features = ["full"] }
 katana-core = { path = "../katana-core" }
 serde.workspace = true
+serde_json.workspace = true
 starknet.workspace = true
 starknet_api.workspace = true
 thiserror.workspace = true

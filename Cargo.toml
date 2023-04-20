@@ -2,11 +2,7 @@
 
 resolver = "2"
 
-members = [
-    "crates/katana-cli",
-    "crates/katana-core",
-    "crates/katana-rpc"
-]
+members = ["crates/katana-cli", "crates/katana-core", "crates/katana-rpc"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,15 +13,18 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 anyhow = "1.0.66"
+cairo-lang-starknet = { git = "https://github.com/starkware-libs/cairo", rev = "b16a151" }
 log = "0.4.17"
 serde = "1.0.156"
+serde_json = "1.0.96"
 thiserror = "1.0.32"
 tokio = { version = "1.16", features = ["full"] }
 starknet = { git = "https://github.com/xJonathanLEI/starknet-rs", rev = "5d3f9d7cc6df0d01a299f0fb0ebc00ec2f28b983" }
 starknet_api = { git = "https://github.com/starkware-libs/starknet-api" }
 
 [patch."https://github.com/starkware-libs/blockifier"]
-blockifier = { git = "https://github.com/dojoengine/blockifier", rev = "0b2e2f0800d68372888496ea0db989555681f2e8" }
+blockifier = { git = "https://github.com/dojoengine/blockifier", rev = "25064d28ba886b291a30e074bb7483aa90f21124" }
 
 [patch."https://github.com/starkware-libs/starknet-api"]
 starknet_api = { git = "https://github.com/dojoengine/starknet-api", rev = "07432d6acd1afc83d341a01ffd49c55ef06146cd" }
+
