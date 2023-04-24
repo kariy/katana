@@ -5,15 +5,18 @@ use jsonrpsee::{
     types::error::CallError,
 };
 use katana_core::sequencer::KatanaSequencer;
-use starknet::providers::jsonrpc::models::BlockId;
-use starknet::{core::types::FieldElement, providers::jsonrpc::models::DeployTransactionResult};
-use starknet_api::patricia_key;
-use starknet_api::state::StorageKey;
+use starknet::{
+    core::types::FieldElement,
+    providers::jsonrpc::models::{
+        BlockId, BroadcastedInvokeTransaction, DeployTransactionResult, InvokeTransactionResult,
+    },
+};
 use starknet_api::{
-    core::{ClassHash, ContractAddress, PatriciaKey},
+    core::{ClassHash, ContractAddress, Nonce, PatriciaKey},
     hash::StarkFelt,
-    stark_felt,
-    transaction::{Calldata, ContractAddressSalt, TransactionVersion},
+    patricia_key, stark_felt,
+    state::StorageKey,
+    transaction::{Calldata, ContractAddressSalt, Fee, TransactionHash, TransactionVersion},
 };
 use starknet_api::{hash::StarkHash, transaction::TransactionSignature};
 use std::{net::SocketAddr, sync::Arc};
@@ -135,6 +138,39 @@ impl KatanaApiServer for KatanaRpc {
 
         FieldElement::from_byte_slice_be(storage.bytes())
             .map_err(|_| Error::from(KatanaApiError::InternalServerError))
+    }
+
+    async fn add_invoke_transaction(
+        &self,
+        invoke_transaction: BroadcastedInvokeTransaction,
+    ) -> Result<InvokeTransactionResult, Error> {
+        match invoke_transaction {
+            BroadcastedInvokeTransaction::V0(_) => {
+                unimplemented!("invoke transaction v0")
+            }
+
+            BroadcastedInvokeTransaction::V1(tx) => {
+                let transaction_hash: TransactionHash = self
+                    .sequencer
+                    .invoke(
+                        ContractAddress(patricia_key!(tx.sender_address)),
+                        Calldata(Arc::new(
+                            tx.calldata.into_iter().map(StarkFelt::from).collect(),
+                        )),
+                        Nonce(StarkFelt::from(tx.nonce)),
+                        Fee(tx.max_fee.to_string().parse().unwrap()),
+                        TransactionSignature(
+                            tx.signature.into_iter().map(StarkFelt::from).collect(),
+                        ),
+                    )
+                    .await?;
+
+                Ok(InvokeTransactionResult {
+                    transaction_hash: FieldElement::from_byte_slice_be(transaction_hash.0.bytes())
+                        .map_err(|_| Error::from(KatanaApiError::InternalServerError))?,
+                })
+            }
+        }
     }
 }
 

@@ -1,4 +1,6 @@
-use crate::{block_context::Base, state::DictStateReader};
+use crate::{
+    block_context::Base, state::DictStateReader, util::compute_invoke_v1_transaction_hash,
+};
 use blockifier::{
     abi::abi_utils::get_storage_var_address,
     block_context::BlockContext,
@@ -15,8 +17,8 @@ use starknet_api::{
     stark_felt,
     state::StorageKey,
     transaction::{
-        Calldata, ContractAddressSalt, DeployAccountTransaction, Fee, TransactionHash,
-        TransactionSignature, TransactionVersion,
+        Calldata, ContractAddressSalt, DeployAccountTransaction, Fee, InvokeTransactionV1,
+        TransactionHash, TransactionSignature, TransactionVersion,
     },
 };
 use std::sync::Mutex;
@@ -130,6 +132,37 @@ impl KatanaSequencer {
             .lock()
             .unwrap()
             .get_storage_at(contract_address, storage_key)
+    }
+
+    pub async fn invoke(
+        &self,
+        sender_address: ContractAddress,
+        calldata: Calldata,
+        nonce: Nonce,
+        max_fee: Fee,
+        signature: TransactionSignature,
+    ) -> anyhow::Result<TransactionHash> {
+        let transaction_hash = compute_invoke_v1_transaction_hash(
+            sender_address,
+            calldata.clone(),
+            nonce,
+            max_fee,
+            self.block_context.chain_id.clone(),
+        );
+
+        let invoke_tx = InvokeTransactionV1 {
+            nonce,
+            max_fee,
+            calldata,
+            signature,
+            sender_address,
+            transaction_hash,
+        };
+
+        let tx = AccountTransaction::Invoke(invoke_tx);
+        tx.execute(&mut self.state.lock().unwrap(), &self.block_context)?;
+
+        Ok(transaction_hash)
     }
 }
 
