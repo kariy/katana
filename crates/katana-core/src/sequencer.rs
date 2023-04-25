@@ -141,7 +141,7 @@ impl KatanaSequencer {
         let max_fee = Fee(u128::from_be_bytes(max_fee_b16.try_into().unwrap()));
 
         let (transaction_hash, contract_class, class_hash, declare_txn) = match version {
-            0..2 => {
+            0 | 1 => {
                 let contract_class = ContractClass::default();
                 let class_hash = ClassHash::default();
                 let transaction_hash = compute_legacy_declare_hash(
