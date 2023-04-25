@@ -56,6 +56,7 @@ impl KatanaApiServer for KatanaRpc {
     async fn get_nonce(&self, contract_address: String) -> Result<String, Error> {
         let nonce = self
             .sequencer
+            .starknet
             .state
             .lock()
             .unwrap()
@@ -66,7 +67,7 @@ impl KatanaApiServer for KatanaRpc {
     }
 
     async fn block_number(&self) -> Result<u64, Error> {
-        Ok(self.sequencer.block_context.block_number.0)
+        Ok(self.sequencer.starknet.block_context.block_number.0)
     }
 
     async fn add_deploy_account_transaction(

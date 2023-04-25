@@ -6,5 +6,6 @@ pub const UNIVERSAL_DEPLOYER_CONTRACT_ADDRESS: &str =
 
 mod block_context;
 pub mod sequencer;
+mod starknet;
 pub mod state;
 mod util;

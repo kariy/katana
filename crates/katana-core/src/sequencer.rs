@@ -1,11 +1,10 @@
-use crate::{block_context::Base, state::DictStateReader};
+use anyhow::Result;
+
+use crate::starknet::{Config, StarknetBlock, StarknetWrapper};
+
 use blockifier::{
     abi::abi_utils::get_storage_var_address,
-    block_context::BlockContext,
-    state::{
-        cached_state::CachedState,
-        state_api::{State, StateReader},
-    },
+    state::state_api::{State, StateReader},
     transaction::{account_transaction::AccountTransaction, transactions::ExecutableTransaction},
 };
 use starknet::providers::jsonrpc::models::BlockId;
@@ -19,18 +18,15 @@ use starknet_api::{
         TransactionSignature, TransactionVersion,
     },
 };
-use std::sync::Mutex;
 
 pub struct KatanaSequencer {
-    pub block_context: BlockContext,
-    pub state: Mutex<CachedState<DictStateReader>>,
+    pub starknet: StarknetWrapper,
 }
 
 impl KatanaSequencer {
-    pub fn new() -> Self {
+    pub fn new(origin: StarknetBlock, config: Config) -> Self {
         Self {
-            block_context: BlockContext::base(),
-            state: Mutex::new(CachedState::new(DictStateReader::new())),
+            starknet: StarknetWrapper::new(origin, config),
         }
     }
 
@@ -53,8 +49,8 @@ impl KatanaSequencer {
 
         let deployed_account_balance_key =
             get_storage_var_address("ERC20_balances", &[*contract_address.0.key()]).unwrap();
-        self.state.lock().unwrap().set_storage_at(
-            self.block_context.fee_token_address,
+        self.starknet.state.lock().unwrap().set_storage_at(
+            self.starknet.block_context.fee_token_address,
             deployed_account_balance_key,
             stark_felt!(balance),
         );
@@ -86,11 +82,10 @@ impl KatanaSequencer {
 
         let account_balance_key =
             get_storage_var_address("ERC20_balances", &[*contract_address.0.key()]).unwrap();
-        let max_fee = self
-            .state
-            .lock()
-            .unwrap()
-            .get_storage_at(self.block_context.fee_token_address, account_balance_key)?;
+        let max_fee = self.starknet.state.lock().unwrap().get_storage_at(
+            self.starknet.block_context.fee_token_address,
+            account_balance_key,
+        )?;
 
         // TODO: Compute txn hash
         let tx_hash = TransactionHash::default();
@@ -105,7 +100,10 @@ impl KatanaSequencer {
             signature,
             transaction_hash: tx_hash,
         });
-        tx.execute(&mut self.state.lock().unwrap(), &self.block_context)?;
+        tx.execute(
+            &mut self.starknet.state.lock().unwrap(),
+            &self.starknet.block_context,
+        )?;
 
         Ok((tx_hash, contract_address))
     }
@@ -115,7 +113,8 @@ impl KatanaSequencer {
         _block_id: BlockId,
         contract_address: ContractAddress,
     ) -> Result<ClassHash, blockifier::state::errors::StateError> {
-        self.state
+        self.starknet
+            .state
             .lock()
             .unwrap()
             .get_class_hash_at(contract_address)
@@ -126,15 +125,10 @@ impl KatanaSequencer {
         contract_address: ContractAddress,
         storage_key: StorageKey,
     ) -> Result<StarkFelt, blockifier::state::errors::StateError> {
-        self.state
+        self.starknet
+            .state
             .lock()
             .unwrap()
             .get_storage_at(contract_address, storage_key)
-    }
-}
-
-impl Default for KatanaSequencer {
-    fn default() -> Self {
-        Self::new()
     }
 }
