@@ -81,7 +81,7 @@ jobs:
             --label "rpc" \
             --label "automated" \
             --search "starknet-specs release ${TAG}" \
-            --state all \
+            --state open \
             --json number \
             --jq 'length')
           echo "exists=$([[ "$EXISTING" -gt 0 ]] && echo true || echo false)" >> $GITHUB_OUTPUT
