@@ -106,9 +106,8 @@ jobs:
 
       - name: Generate spec diff
         if: steps.version-check.outputs.needs_update == 'true' && steps.check-existing.outputs.exists == 'false'
-        id: diff
         run: |
-          DIFF=$(uv run scripts/diff-openrpc-specs.py \
+          uv run scripts/diff-openrpc-specs.py \
             --old-read /tmp/specs/old/starknet_api_openrpc.json \
             --new-read /tmp/specs/new/starknet_api_openrpc.json \
             --old-write /tmp/specs/old/starknet_write_api.json \
@@ -116,16 +115,14 @@ jobs:
             --old-trace /tmp/specs/old/starknet_trace_api_openrpc.json \
             --new-trace /tmp/specs/new/starknet_trace_api_openrpc.json \
             --old-version "${{ steps.current-version.outputs.version }}" \
-            --new-version "${{ steps.latest-release.outputs.version }}")
-
-          echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+            --new-version "${{ steps.latest-release.outputs.version }}" \
+            > /tmp/specs/diff.md
 
       - name: Create tracking issue
         if: steps.version-check.outputs.needs_update == 'true' && steps.check-existing.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BODY: ${{ steps.latest-release.outputs.body }}
         run: |
           TAG="${{ steps.latest-release.outputs.tag }}"
           NAME="${{ steps.latest-release.outputs.name }}"
@@ -133,7 +130,7 @@ jobs:
           PUBLISHED="${{ steps.latest-release.outputs.published_at }}"
           CURRENT="${{ steps.current-version.outputs.version }}"
 
-          cat > /tmp/issue-body.md <<ISSUE_EOF
+          cat > /tmp/issue-body.md <<HEADER_EOF
           A new version of [starknet-specs](https://github.com/starkware-libs/starknet-specs) has been released.
 
           **Release:** [${NAME}](${URL})
@@ -143,24 +140,28 @@ jobs:
 
           ### Release Notes
 
-          ${{ steps.latest-release.outputs.body }}
+          HEADER_EOF
 
-          ---
+          echo "$RELEASE_BODY" >> /tmp/issue-body.md
+          echo "" >> /tmp/issue-body.md
+          echo "---" >> /tmp/issue-body.md
+          echo "" >> /tmp/issue-body.md
+          cat /tmp/specs/diff.md >> /tmp/issue-body.md
 
-          ${{ steps.diff.outputs.diff }}
+          cat >> /tmp/issue-body.md <<'FOOTER_EOF'
 
           ---
 
           ### Action Items
 
           - [ ] Review the API changes above
-          - [ ] Update \`RPC_SPEC_VERSION\` in \`crates/rpc/rpc-api/src/starknet.rs\`
+          - [ ] Update `RPC_SPEC_VERSION` in `crates/rpc/rpc-api/src/starknet.rs`
           - [ ] Implement new methods (if any)
           - [ ] Update changed method signatures (if any)
           - [ ] Remove deprecated methods (if any)
-          - [ ] Update RPC type definitions in \`crates/rpc/rpc-types/\`
+          - [ ] Update RPC type definitions in `crates/rpc/rpc-types/`
           - [ ] Add/update tests for changed endpoints
-          ISSUE_EOF
+          FOOTER_EOF
 
           gh issue create \
             --repo ${{ github.repository }} \
