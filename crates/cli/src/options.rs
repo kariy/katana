@@ -920,6 +920,18 @@ impl TracerOptions {
     }
 }
 
+#[derive(Debug, Args, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[command(next_help_heading = "Trie options")]
+pub struct TrieOptions {
+    /// Disable state trie computation.
+    ///
+    /// By default, the node computes and verifies state roots against expected values
+    /// from block headers during synchronization. Use this flag to skip trie computation.
+    #[arg(long = "trie.disable")]
+    #[serde(default)]
+    pub disable: bool,
+}
+
 #[derive(Debug, Args, Clone, Serialize, Deserialize, PartialEq)]
 #[command(next_help_heading = "Pruning options")]
 pub struct PruningOptions {

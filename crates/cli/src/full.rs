@@ -5,6 +5,7 @@ pub use clap::Parser;
 use katana_full_node::config::db::DbConfig;
 use katana_full_node::config::metrics::MetricsConfig;
 use katana_full_node::config::rpc::RpcConfig;
+use katana_full_node::config::trie::TrieConfig;
 use katana_full_node::Network;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -53,6 +54,9 @@ pub struct FullNodeArgs {
     #[cfg(feature = "explorer")]
     #[command(flatten)]
     pub explorer: ExplorerOptions,
+
+    #[command(flatten)]
+    pub trie: TrieOptions,
 
     #[command(flatten)]
     pub pruning: PruningOptions,
@@ -114,6 +118,7 @@ impl FullNodeArgs {
             pruning,
             network: self.network,
             gateway_api_key: self.gateway_api_key.clone(),
+            trie: TrieConfig { compute: !self.trie.disable },
         })
     }
 
