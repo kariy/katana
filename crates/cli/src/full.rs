@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 pub use clap::Parser;
 use katana_full_node::config::db::DbConfig;
@@ -22,14 +20,6 @@ pub struct FullNodeArgs {
     #[arg(long)]
     pub silent: bool,
 
-    /// Directory path of the database to initialize from.
-    ///
-    /// The path must either be an empty directory or a directory which already contains a
-    /// previously initialized Katana database.
-    #[arg(long)]
-    #[arg(value_name = "PATH")]
-    pub db_dir: PathBuf,
-
     #[arg(long)]
     pub network: Network,
 
@@ -37,6 +27,9 @@ pub struct FullNodeArgs {
     #[arg(long)]
     #[arg(value_name = "KEY")]
     pub gateway_api_key: Option<String>,
+
+    #[command(flatten)]
+    pub db: DbOptions,
 
     #[command(flatten)]
     pub logging: LoggingOptions,
@@ -155,7 +148,7 @@ impl FullNodeArgs {
     }
 
     fn db_config(&self) -> DbConfig {
-        DbConfig { dir: Some(self.db_dir.clone()) }
+        DbConfig { dir: self.db.dir.clone(), open_mode: self.db.open_mode }
     }
 
     fn rpc_config(&self) -> Result<RpcConfig> {
@@ -203,5 +196,45 @@ impl FullNodeArgs {
 
     fn tracer_config(&self) -> Option<katana_tracing::TracerConfig> {
         self.tracer.config()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use katana_full_node::config::db::DbOpenMode;
+
+    use super::*;
+
+    #[test]
+    fn full_node_defaults_to_compat_db_open_mode() {
+        let args = FullNodeArgs::parse_from([
+            "katana",
+            "--db-dir",
+            "/tmp/katana-db",
+            "--network",
+            "mainnet",
+        ]);
+        let config = args.config().unwrap();
+
+        assert_eq!(config.db.dir, Some(PathBuf::from("/tmp/katana-db")));
+        assert_eq!(config.db.open_mode, DbOpenMode::Compat);
+    }
+
+    #[test]
+    fn full_node_accepts_strict_db_open_mode() {
+        let args = FullNodeArgs::parse_from([
+            "katana",
+            "--db-dir",
+            "/tmp/katana-db",
+            "--network",
+            "mainnet",
+            "--db-open-mode",
+            "strict",
+        ]);
+        let config = args.config().unwrap();
+
+        assert_eq!(config.db.open_mode, DbOpenMode::Strict);
     }
 }

@@ -70,14 +70,6 @@ pub struct SequencerNodeArgs {
     #[arg(value_name = "TOTAL")]
     pub block_cairo_steps_limit: Option<u64>,
 
-    /// Directory path of the database to initialize from.
-    ///
-    /// The path must either be an empty directory or a directory which already contains a
-    /// previously initialized Katana database.
-    #[arg(long, alias = "db-dir")]
-    #[arg(value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
-
     /// Configuration file
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -96,6 +88,9 @@ pub struct SequencerNodeArgs {
     #[arg(help = "The Ethereum RPC provider to sample the gas prices from to enable the gas \
                   price oracle.")]
     pub l1_provider_url: Option<Url>,
+
+    #[command(flatten)]
+    pub db: DbOptions,
 
     #[command(flatten)]
     pub logging: LoggingOptions,
@@ -526,7 +521,7 @@ impl SequencerNodeArgs {
     }
 
     fn db_config(&self) -> DbConfig {
-        DbConfig { dir: self.data_dir.clone() }
+        DbConfig { dir: self.db.dir.clone(), open_mode: self.db.open_mode }
     }
 
     fn metrics_config(&self) -> Option<MetricsConfig> {
@@ -699,9 +694,7 @@ impl SequencerNodeArgs {
             self.block_time = config.block_time;
         }
 
-        if self.data_dir.is_none() {
-            self.data_dir = config.data_dir;
-        }
+        self.db.merge(config.db.as_ref());
 
         if self.logging == LoggingOptions::default() {
             if let Some(logging) = config.logging {
@@ -782,6 +775,7 @@ mod test {
     };
     use katana_primitives::chain::ChainId;
     use katana_primitives::{address, felt, Felt};
+    use katana_sequencer_node::config::db::DbOpenMode;
     use katana_sequencer_node::config::execution::{
         DEFAULT_INVOCATION_MAX_STEPS, DEFAULT_VALIDATION_MAX_STEPS,
     };
@@ -802,6 +796,7 @@ mod test {
         assert_eq!(config.execution.invocation_max_steps, DEFAULT_INVOCATION_MAX_STEPS);
         assert_eq!(config.execution.validation_max_steps, DEFAULT_VALIDATION_MAX_STEPS);
         assert_eq!(config.db.dir, None);
+        assert_eq!(config.db.open_mode, DbOpenMode::Compat);
         assert_eq!(config.chain.id(), ChainId::parse("KATANA").unwrap());
         assert_eq!(config.chain.genesis().sequencer_address, *DEFAULT_SEQUENCER_ADDRESS);
     }
@@ -821,6 +816,8 @@ mod test {
             "100",
             "--data-dir",
             "/path/to/db",
+            "--db-open-mode",
+            "strict",
         ]);
         let result = args.config().unwrap();
         let config = &result;
@@ -830,6 +827,7 @@ mod test {
         assert_eq!(config.execution.invocation_max_steps, 200);
         assert_eq!(config.execution.validation_max_steps, 100);
         assert_eq!(config.db.dir, Some(PathBuf::from("/path/to/db")));
+        assert_eq!(config.db.open_mode, DbOpenMode::Strict);
         assert_eq!(config.chain.id(), ChainId::GOERLI);
         assert_eq!(config.chain.genesis().sequencer_address, *DEFAULT_SEQUENCER_ADDRESS);
     }
@@ -840,6 +838,41 @@ mod test {
         let args = SequencerNodeArgs::parse_from(["katana", "--db-dir", "/path/to/db"]);
         let result = args.config().unwrap();
         assert_eq!(result.db.dir, Some(PathBuf::from("/path/to/db")));
+    }
+
+    #[test]
+    fn db_open_mode_from_config_file() {
+        let content = r#"
+db_open_mode = "strict"
+        "#;
+        let path = std::env::temp_dir().join("katana-db-open-mode.toml");
+        std::fs::write(&path, content).unwrap();
+
+        let args =
+            SequencerNodeArgs::parse_from(["katana", "--config", path.to_string_lossy().as_ref()]);
+        let result = args.with_config_file().unwrap().config().unwrap();
+
+        assert_eq!(result.db.open_mode, DbOpenMode::Strict);
+    }
+
+    #[test]
+    fn cli_db_open_mode_overrides_config_file() {
+        let content = r#"
+db_open_mode = "compat"
+        "#;
+        let path = std::env::temp_dir().join("katana-db-open-mode-cli.toml");
+        std::fs::write(&path, content).unwrap();
+
+        let args = SequencerNodeArgs::parse_from([
+            "katana",
+            "--config",
+            path.to_string_lossy().as_ref(),
+            "--db-open-mode",
+            "strict",
+        ]);
+        let result = args.with_config_file().unwrap().config().unwrap();
+
+        assert_eq!(result.db.open_mode, DbOpenMode::Strict);
     }
 
     #[test]
