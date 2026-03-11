@@ -58,6 +58,12 @@ pub struct FullNodeArgs {
 
     #[command(flatten)]
     pub pruning: PruningOptions,
+
+    /// The maximum block number to sync to. Once reached, the pipeline stops
+    /// syncing but the node and RPC server remain running.
+    #[arg(long = "sync.tip")]
+    #[arg(value_name = "BLOCK_NUMBER")]
+    pub max_sync_tip: Option<u64>,
 }
 
 impl FullNodeArgs {
@@ -119,6 +125,7 @@ impl FullNodeArgs {
             network: self.network,
             gateway_api_key: self.gateway_api_key.clone(),
             trie: TrieConfig { compute: !self.trie.disable },
+            max_sync_tip: self.max_sync_tip,
         })
     }
 
