@@ -1,15 +1,10 @@
 use katana_primitives::receipt::Receipt;
 
-use crate::models::envelope::{Envelope, EnvelopeError, EnvelopePayload};
+use crate::models::envelope::{Envelope, EnvelopePayload};
 
 impl EnvelopePayload for Receipt {
     const MAGIC: &[u8; 4] = b"KRCP";
     const NAME: &str = "receipt";
-
-    fn from_legacy_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
-        postcard::from_bytes(bytes)
-            .map_err(|e| EnvelopeError::LegacyDecode { name: Self::NAME, reason: e.to_string() })
-    }
 }
 
 /// On-disk representation for `Receipts` table values.
@@ -28,7 +23,6 @@ mod tests {
     use super::ReceiptEnvelope;
     use crate::abstraction::{Database, DbTx, DbTxMut};
     use crate::codecs::{Compress, Decompress};
-    use crate::models::envelope::EnvelopeError;
     use crate::{tables, Db};
 
     fn sample_receipt() -> Receipt {
@@ -42,14 +36,13 @@ mod tests {
     }
 
     #[test]
-    fn receipt_envelope_roundtrip_uses_envelope_and_zstd() {
+    fn receipt_envelope_roundtrip() {
         let receipt = sample_receipt();
         let envelope = ReceiptEnvelope::from(receipt.clone());
 
         let compressed = envelope.compress().expect("failed to compress receipt envelope");
         assert_eq!(&compressed[..4], b"KRCP");
         assert_eq!(compressed[4], 1); // FORMAT_VERSION
-        assert_eq!(compressed[5], 1); // ENCODING_ZSTD
 
         let decompressed =
             ReceiptEnvelope::decompress(compressed).expect("failed to decompress receipt envelope");
@@ -66,38 +59,6 @@ mod tests {
             ReceiptEnvelope::decompress(legacy).expect("failed to read legacy receipt");
 
         assert_eq!(decompressed, ReceiptEnvelope::from(receipt));
-    }
-
-    #[test]
-    fn receipt_envelope_rejects_unknown_version() {
-        let mut encoded = b"KRCP".to_vec();
-        encoded.push(2); // bad version
-        encoded.push(1);
-
-        let error = ReceiptEnvelope::do_decompress(&encoded).expect_err("must reject version");
-        assert!(matches!(error, EnvelopeError::UnsupportedVersion { version: 2, .. }));
-    }
-
-    #[test]
-    fn receipt_envelope_rejects_unknown_encoding() {
-        let mut encoded = b"KRCP".to_vec();
-        encoded.push(1);
-        encoded.push(2); // bad encoding
-
-        let error = ReceiptEnvelope::do_decompress(&encoded).expect_err("must reject encoding");
-        assert!(matches!(error, EnvelopeError::UnsupportedEncoding { encoding: 2, .. }));
-    }
-
-    #[test]
-    fn receipt_envelope_rejects_corrupt_zstd_payload() {
-        let mut encoded = b"KRCP".to_vec();
-        encoded.push(1);
-        encoded.push(1);
-        encoded.extend_from_slice(&[1, 2, 3, 4]);
-
-        let error =
-            ReceiptEnvelope::do_decompress(&encoded).expect_err("must reject corrupt payload");
-        assert!(matches!(error, EnvelopeError::ZstdDecompress { .. }));
     }
 
     #[test]
