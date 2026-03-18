@@ -487,7 +487,17 @@ impl From<RpcTxReceipt> for Receipt {
                 })
             }
 
-            RpcTxReceipt::Deploy(_) => unimplemented!(),
+            RpcTxReceipt::Deploy(rct) => Receipt::Deploy(receipt::DeployTxReceipt {
+                fee: rct.actual_fee.into(),
+                events: rct.events,
+                messages_sent: rct.messages_sent,
+                revert_error: match rct.execution_result {
+                    ExecutionResult::Succeeded => None,
+                    ExecutionResult::Reverted { reason } => Some(reason),
+                },
+                execution_resources: rct.execution_resources.into(),
+                contract_address: rct.contract_address,
+            }),
         }
     }
 }
