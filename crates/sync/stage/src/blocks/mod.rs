@@ -15,7 +15,7 @@ use katana_provider::api::block::{BlockHashProvider, BlockWriter};
 use katana_provider::api::state::HistoricalStateRetentionProvider;
 use katana_provider::{DbProviderFactory, MutableProvider, ProviderError, ProviderFactory};
 use rayon::prelude::*;
-use tracing::{error, info_span, warn, Instrument};
+use tracing::{error, info_span, Instrument};
 
 use crate::{
     PruneInput, PruneOutput, PruneResult, Stage, StageExecutionInput, StageExecutionOutput,
@@ -119,30 +119,26 @@ where
             // Phase 1: Compute commitments and verify hashes in parallel.
             // These are CPU-bound hash computations with no inter-block dependencies.
             let mut blocks = blocks;
-            blocks.par_iter_mut().for_each(|block_data| {
-                let block_number = block_data.block.block.header.number;
+            blocks.par_iter_mut().try_for_each(|block_data| {
+                let block_hash = block_data.block.block.hash;
+                let block_num = block_data.block.block.header.number;
 
-                // Compute missing commitments for older blocks where the source
-                // doesn't include them in the block header.
-                hash::compute_missing_commitments(
+                let verified = hash::patch_and_verify_block_hash(
                     &mut block_data.block.block,
                     &block_data.receipts,
                     &block_data.state_updates.state_updates,
+                    &self.chain_id,
                 );
 
-                // Verify the block hash matches what we compute locally.
-                let computed_hash =
-                    hash::compute_hash(&block_data.block.block.header, &self.chain_id);
-
-                if computed_hash != block_data.block.block.hash {
-                    warn!(
-                        block = %block_number,
-                        expected = %format!("{:#x}", block_data.block.block.hash),
-                        computed = %format!("{:#x}", computed_hash),
-                        "Block hash mismatch"
-                    );
+                if verified {
+                    Ok(())
+                } else {
+                    Err(Error::BlockVerificationFailed {
+                        block_num,
+                        expected_block_hash: block_hash,
+                    })
                 }
-            });
+            })?;
 
             // Phase 2: Write blocks to the database sequentially.
             let provider_mut = self.provider.provider_mut();
@@ -531,9 +527,6 @@ pub enum Error {
     )]
     ChainInvariantViolation { block_num: u64, parent_hash: Felt, expected_hash: Felt },
 
-    #[error(
-        "block hash mismatch: block {block_num} gateway hash {expected:#x} does not match \
-         computed hash {computed:#x}"
-    )]
-    BlockHashMismatch { block_num: u64, expected: Felt, computed: Felt },
+    #[error("block hash verification failed: block {block_num} hash {expected_block_hash:#x}")]
+    BlockVerificationFailed { block_num: u64, expected_block_hash: Felt },
 }
