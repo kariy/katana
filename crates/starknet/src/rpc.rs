@@ -40,7 +40,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(url: Url) -> Self {
-        Client::new_with_client(HttpClient::builder().build(url).unwrap())
+        // Some blocks can have very large responses (e.g., getBlockWithReceipts for mainnet blocks
+        // 1256131 (~19MB) and 1256132 (~16MB) exceed the default 10MB limit).
+        Client::new_with_client(
+            HttpClient::builder().max_response_size(50 * 1024 * 1024).build(url).unwrap(),
+        )
     }
 
     pub fn new_with_client(client: HttpClient) -> Self {
