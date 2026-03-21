@@ -2483,6 +2483,86 @@
     },
     {
       "datasource": "Prometheus",
+      "description": "Estimated time remaining to complete sync based on recent sync rate",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "N/A"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3600
+              },
+              {
+                "color": "red",
+                "value": 86400
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 77
+      },
+      "id": 140,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "(katana_sync_pipeline_sync_target{instance=~\"$instance\"} - katana_sync_pipeline_sync_position{instance=~\"$instance\"}) / rate(katana_sync_pipeline_sync_position{instance=~\"$instance\"}[5m])",
+          "instant": false,
+          "legendFormat": "ETA",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated Time to Complete",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
       "description": "Blocks processed per second by each stage",
       "fieldConfig": {
         "defaults": {
