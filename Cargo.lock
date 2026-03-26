@@ -7047,7 +7047,6 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "clap",
- "futures",
  "katana-chain-spec",
  "katana-core",
  "katana-db",
