@@ -2896,7 +2896,6 @@ version = "1.7.0"
 dependencies = [
  "anyhow",
  "ark-ff 0.4.2",
- "cainome-cairo-serde",
  "katana-contracts",
  "katana-genesis",
  "katana-primitives",
@@ -12902,6 +12901,29 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "vrf-e2e-test"
+version = "1.7.0"
+dependencies = [
+ "axum 0.7.9",
+ "cainome",
+ "cartridge",
+ "katana-cli",
+ "katana-contracts",
+ "katana-genesis",
+ "katana-primitives",
+ "katana-rpc-api",
+ "katana-rpc-types",
+ "katana-sequencer-node",
+ "katana-utils",
+ "lazy_static",
+ "serde_json",
+ "starknet 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "starknet-crypto 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "wait-timeout"

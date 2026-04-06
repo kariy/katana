@@ -18,7 +18,7 @@ use setup::*;
 /// ## Expected:
 ///
 /// The request is forwarded unchanged and the response is passed through.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn estimate_fee_forwards_when_deployed_account() {
     let expected_estimates = vec![arbitrary!(FeeEstimate)];
 
@@ -51,7 +51,7 @@ async fn estimate_fee_forwards_when_deployed_account() {
 ///
 /// The middleware prepends a deploy transaction to the estimate fee
 /// request and returns estimates for the original transactions only.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn estimate_fee_prepends_deploy_tx_for_controller() {
     let cartridge_responses = HashMap::from_iter([(
         CONTROLLER_ADDRESS,
@@ -91,7 +91,7 @@ async fn estimate_fee_prepends_deploy_tx_for_controller() {
 ///
 /// Even though the address is undeployed, no deploy transaction is created and the original request
 /// is forwarded unchanged.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn estimate_fee_forwards_for_undeployed_non_controller() {
     let expected_estimates = vec![arbitrary!(FeeEstimate)];
     let rpc_responses = HashMap::from_iter([("starknet_estimateFee", expected_estimates.clone())]);
@@ -126,7 +126,7 @@ async fn estimate_fee_forwards_for_undeployed_non_controller() {
 /// despite three transactions from the same sender.
 ///
 /// Inner service receives 4 txs (1 deploy + 3 original); middleware returns 3 zero-fee estimates.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn estimate_fee_deduplicates_same_controller() {
     let expected_estimates = vec![
         arbitrary!(FeeEstimate), // prepended contorller deploy tx
@@ -176,7 +176,7 @@ async fn estimate_fee_deduplicates_same_controller() {
 ///
 /// RPC service receives request unchanged; pool remains empty; Cartridge API receives no
 /// requests.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn execute_outside_skips_deploy_when_already_deployed() {
     let setup = setup_test(HashMap::new(), HashMap::new()).await;
 
@@ -209,7 +209,7 @@ async fn execute_outside_skips_deploy_when_already_deployed() {
 /// the original request to the inner service.
 ///
 /// Pool contains 1 deploy transaction; inner service receives request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn execute_outside_deploys_controller() {
     let cartridge_responses = HashMap::from_iter([(
         CONTROLLER_ADDRESS,
@@ -242,7 +242,7 @@ async fn execute_outside_deploys_controller() {
 /// The middleware skips deployment and forwards the request unchanged.
 ///
 /// Pool remains empty; inner service receives request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn execute_outside_skips_deploy_for_non_controller() {
     let setup = setup_test(HashMap::new(), HashMap::new()).await;
 
@@ -270,7 +270,7 @@ async fn execute_outside_skips_deploy_for_non_controller() {
 /// ## Expected:
 ///
 /// Deploy transaction added to pool and request forwarded.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn execute_outside_tx_method_variant() {
     let cartridge_responses = {
         let mut m = HashMap::new();
@@ -305,7 +305,7 @@ async fn execute_outside_tx_method_variant() {
 /// ## Expected:
 ///
 /// inner service receives request unchanged; no Cartridge API requests made.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn passthrough_other_methods() {
     let setup = setup_test(HashMap::new(), HashMap::new()).await;
 
@@ -331,7 +331,7 @@ async fn passthrough_other_methods() {
 /// ## Expected:
 ///
 /// Inner service receives request unchanged.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn passthrough_malformed_estimate_fee() {
     let setup = setup_test(HashMap::new(), HashMap::new()).await;
 
@@ -366,7 +366,7 @@ mod setup {
     use katana_pool::validation::NoopValidator;
     use katana_primitives::da::DataAvailabilityMode;
     use katana_primitives::execution::Call;
-    use katana_primitives::fee::{AllResourceBoundsMapping, ResourceBoundsMapping, Tip};
+    use katana_primitives::fee::{AllResourceBoundsMapping, PriceUnit, ResourceBoundsMapping, Tip};
     use katana_primitives::transaction::{ExecutableTxWithHash, TxHash, TxNumber};
     use katana_primitives::{address, felt, ContractAddress, Felt};
     use katana_provider::api::state::StateProvider;
@@ -400,7 +400,7 @@ mod setup {
     type TestControllerDeploymentService = ControllerDeploymentService<
         MockRpcService,
         TestPool,
-        NoPendingBlockProvider,
+        MockPendingBlockProvider,
         katana_provider::DbProviderFactory,
     >;
 
@@ -458,7 +458,7 @@ mod setup {
             chain_spec,
             pool.clone(),
             task_spawner,
-            NoPendingBlockProvider,
+            MockPendingBlockProvider,
             gas_oracle,
             config,
             storage,
@@ -581,9 +581,9 @@ mod setup {
     /// A no-op pending block provider. All methods return `Ok(None)`, matching
     /// instant-mining mode behaviour.
     #[derive(Debug, Clone)]
-    struct NoPendingBlockProvider;
+    struct MockPendingBlockProvider;
 
-    impl PendingBlockProvider for NoPendingBlockProvider {
+    impl PendingBlockProvider for MockPendingBlockProvider {
         fn pending_state(&self) -> StarknetApiResult<Option<Box<dyn StateProvider>>> {
             Ok(None)
         }
@@ -617,11 +617,31 @@ mod setup {
             Ok(None)
         }
 
+        // internally, the Controller deployment layer uses StarknetApi::add_invoke_tx_sync which
+        // waits for the receipt to be available before returning. We return a random
+        // receipt here to avoid blocking. The value is irrelevant because it's not being to
+        // assert anything.
         fn get_pending_receipt(
             &self,
-            _hash: TxHash,
+            hash: TxHash,
         ) -> StarknetApiResult<Option<TxReceiptWithBlockInfo>> {
-            Ok(None)
+            let _ = hash;
+            Ok(Some(TxReceiptWithBlockInfo {
+                transaction_hash: TxHash::ZERO,
+                receipt: RpcTxReceipt::Invoke(RpcInvokeTxReceipt {
+                    actual_fee: FeePayment { amount: Felt::ZERO, unit: PriceUnit::Fri },
+                    finality_status: FinalityStatus::PreConfirmed,
+                    messages_sent: Vec::new(),
+                    events: Vec::new(),
+                    execution_resources: ExecutionResources {
+                        l1_data_gas: 0,
+                        l1_gas: 0,
+                        l2_gas: 0,
+                    },
+                    execution_result: ExecutionResult::Succeeded,
+                }),
+                block: ReceiptBlockInfo::PreConfirmed { block_number: 0 },
+            }))
         }
 
         fn get_pending_trace(&self, _hash: TxHash) -> StarknetApiResult<Option<TxTrace>> {
