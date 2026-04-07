@@ -26,12 +26,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+          submodules: recursive
       # Workaround for https://github.com/actions/runner-images/issues/6775
       - run: git config --global --add safe.directory "*"
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: weekly-binary-size-main
+
+      - name: Build contract artifacts
+        run: make contracts
 
       - name: Get binary size (main)
         id: binary-size
@@ -57,6 +61,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
       # Workaround for https://github.com/actions/runner-images/issues/6775
       - run: git config --global --add safe.directory "*"
 
@@ -76,6 +81,8 @@ jobs:
 
           echo "Latest release tag: $LATEST_TAG"
           git checkout $LATEST_TAG
+          git submodule update --init --recursive
+          make contracts
           cargo build --bin katana --profile performance
           BINARY_SIZE=$(stat --format %s ./target/performance/katana)
           echo "size=$BINARY_SIZE" >> $GITHUB_OUTPUT
