@@ -12,7 +12,9 @@ use katana_chain_spec::rollup::ChainConfigDir;
 use katana_chain_spec::ChainSpec;
 use katana_core::constants::DEFAULT_SEQUENCER_ADDRESS;
 use katana_genesis::allocation::DevAllocationsGenerator;
-use katana_genesis::constant::DEFAULT_PREFUNDED_ACCOUNT_BALANCE;
+use katana_genesis::constant::{
+    DEFAULT_FROZEN_DEV_ACCOUNT_ADDRESS_CLASS_HASH, DEFAULT_PREFUNDED_ACCOUNT_BALANCE,
+};
 use katana_messaging::MessagingConfig;
 use katana_sequencer_node::config::db::DbConfig;
 use katana_sequencer_node::config::dev::{DevConfig, FixedL1GasPriceConfig};
@@ -493,6 +495,7 @@ impl SequencerNodeArgs {
             // Generate dev accounts.
             // If paymaster is enabled, the first account is used by default.
             let accounts = DevAllocationsGenerator::new(self.development.total_accounts)
+                .with_frozen_address_class_hash(DEFAULT_FROZEN_DEV_ACCOUNT_ADDRESS_CLASS_HASH)
                 .with_seed(parse_seed(&self.development.seed))
                 .with_balance(U256::from(DEFAULT_PREFUNDED_ACCOUNT_BALANCE))
                 .generate();
@@ -861,6 +864,27 @@ mod test {
         assert_eq!(config.db.dir, None);
         assert_eq!(config.chain.id(), ChainId::parse("KATANA").unwrap());
         assert_eq!(config.chain.genesis().sequencer_address, *DEFAULT_SEQUENCER_ADDRESS);
+    }
+
+    #[test]
+    fn default_predeployed_account_address_is_backward_compatible() {
+        let args = SequencerNodeArgs::parse_from(["katana"]);
+        let result = args.config().unwrap();
+
+        // Keep the first user-facing predeployed account stable. This address/key pair is relied
+        // on by downstream integration tests and tooling that use Katana's default prefunded
+        // account.
+        let (address, allocation) =
+            result.chain.genesis().accounts().next().expect("must have a default dev account");
+
+        assert_eq!(
+            *address,
+            address!("0x127fd5f1fe78a71f8bcd1fec63e3fe2f0486b6ecd5c86a0466c3a21fa5cfcec")
+        );
+        assert_eq!(
+            allocation.private_key(),
+            Some(felt!("0xc5b2fcab997346f3ea1c00b002ecf6f382c5f9c9659a3894eb783c5320f912"))
+        );
     }
 
     #[test]
