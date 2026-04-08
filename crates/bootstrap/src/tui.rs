@@ -1,0 +1,2660 @@
+//! Full-screen ratatui-based TUI for `katana bootstrap --interactive`.
+//!
+//! ## Architecture
+//!
+//! The event loop runs on a `spawn_blocking` thread because crossterm's `event::poll` /
+//! `event::read` are synchronous and would block the async runtime if called directly.
+//! The bootstrap executor itself runs on the regular tokio runtime via `tokio::spawn`,
+//! and streams progress to the UI thread through a `tokio::sync::mpsc::UnboundedSender`
+//! that we drain non-blockingly each tick.
+//!
+//! Visual layout:
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────┐
+//! │  Classes │ Contracts │ Settings │ Execute          │ <- top tab bar
+//! ├────────────────────────────────────────────────────┤
+//! │                                                    │
+//! │              tab-specific content                  │
+//! │                                                    │
+//! ├────────────────────────────────────────────────────┤
+//! │  a add  d delete  Tab next  q quit  …              │ <- bottom hint bar
+//! └────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Modals (add class, add contract, save manifest, …) render as centered overlays on
+//! top of the tab content via `Clear` + a centered `Block`.
+
+use std::io::{self, Stdout};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+use katana_primitives::class::ContractClass;
+use katana_primitives::{ContractAddress, Felt};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::Terminal;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::task::JoinHandle;
+use url::Url;
+
+use crate::embedded::{self, EmbeddedClass};
+use crate::executor::{execute_with_progress, BootstrapEvent, BootstrapReport, ExecutorConfig};
+use crate::manifest::{ClassEntry, ContractEntry, Manifest};
+use crate::plan::{BootstrapPlan, ClassSource, DeclareStep, DeployStep};
+
+// =============================================================================
+// Public entry point
+// =============================================================================
+
+/// CLI-supplied defaults that prefill the Settings tab.
+#[derive(Debug, Clone, Default)]
+pub struct SignerDefaults {
+    pub rpc_url: Option<String>,
+    pub account: Option<ContractAddress>,
+    pub private_key: Option<Felt>,
+}
+
+/// Run the interactive TUI. Blocks (off the async runtime via `spawn_blocking`) until
+/// the user exits. Any unsaved plan is dropped on exit; the only persistence is the
+/// optional "save manifest" prompt offered after a successful execution.
+pub async fn run(initial: Option<Manifest>, defaults: SignerDefaults) -> Result<()> {
+    // Capture a runtime handle so the blocking event-loop thread can still spawn the
+    // executor task back onto the multi-thread tokio runtime.
+    let runtime = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || run_blocking(initial, defaults, runtime))
+        .await
+        .map_err(|e| anyhow!("TUI thread panicked: {e}"))?
+}
+
+fn run_blocking(
+    initial: Option<Manifest>,
+    defaults: SignerDefaults,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
+    let mut app = AppState::new(defaults);
+    if let Some(manifest) = initial {
+        app.load_manifest(&manifest)?;
+    }
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    event_loop(&mut terminal, &mut app, &runtime)
+}
+
+// =============================================================================
+// Terminal RAII guard — restores the terminal even on panic
+// =============================================================================
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+    }
+}
+
+// =============================================================================
+// App state
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Classes,
+    Contracts,
+    Settings,
+    Execute,
+}
+
+impl Tab {
+    const ALL: [Tab; 4] = [Tab::Classes, Tab::Contracts, Tab::Settings, Tab::Execute];
+
+    fn idx(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap()
+    }
+
+    fn next(self) -> Tab {
+        Self::ALL[(self.idx() + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Tab {
+        Self::ALL[(self.idx() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Classes => "Classes",
+            Tab::Contracts => "Contracts",
+            Tab::Settings => "Settings",
+            Tab::Execute => "Execute",
+        }
+    }
+}
+
+struct AppState {
+    current_tab: Tab,
+    classes: Vec<DeclareStep>,
+    classes_state: ListState,
+    contracts: Vec<DeployStep>,
+    contracts_state: ListState,
+    settings: SettingsForm,
+    modal: Option<Modal>,
+    execution: ExecutionState,
+    quit: bool,
+    /// Transient banner (e.g. validation errors) shown in the bottom hint bar.
+    flash: Option<String>,
+}
+
+impl AppState {
+    fn new(defaults: SignerDefaults) -> Self {
+        Self {
+            current_tab: Tab::Classes,
+            classes: Vec::new(),
+            classes_state: ListState::default(),
+            contracts: Vec::new(),
+            contracts_state: ListState::default(),
+            settings: SettingsForm::from_defaults(defaults),
+            modal: None,
+            execution: ExecutionState::Idle,
+            quit: false,
+            flash: None,
+        }
+    }
+
+    fn load_manifest(&mut self, manifest: &Manifest) -> Result<()> {
+        // Reuse the existing manifest → plan resolver so we get the same validation,
+        // file IO, and class-hash computation as programmatic mode.
+        let plan = BootstrapPlan::from_manifest(manifest)?;
+        self.classes = plan.declares;
+        self.contracts = plan.deploys;
+        if !self.classes.is_empty() {
+            self.classes_state.select(Some(0));
+        }
+        if !self.contracts.is_empty() {
+            self.contracts_state.select(Some(0));
+        }
+        Ok(())
+    }
+
+    fn flash<S: Into<String>>(&mut self, msg: S) {
+        self.flash = Some(msg.into());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Settings form
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    RpcUrl,
+    Account,
+    PrivateKey,
+}
+
+impl SettingsField {
+    const ALL: [SettingsField; 3] =
+        [SettingsField::RpcUrl, SettingsField::Account, SettingsField::PrivateKey];
+
+    fn idx(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap()
+    }
+
+    fn next(self) -> SettingsField {
+        Self::ALL[(self.idx() + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> SettingsField {
+        Self::ALL[(self.idx() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsField::RpcUrl => "RPC URL",
+            SettingsField::Account => "Account",
+            SettingsField::PrivateKey => "Private key",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SettingsForm {
+    rpc_url: TextInput,
+    account: TextInput,
+    private_key: TextInput,
+    focused: SettingsField,
+    /// `true` while the user is typing into the focused field.
+    editing: bool,
+}
+
+impl SettingsForm {
+    fn from_defaults(d: SignerDefaults) -> Self {
+        Self {
+            rpc_url: TextInput::from_str(
+                d.rpc_url.unwrap_or_else(|| "http://localhost:5050".to_string()),
+            ),
+            account: TextInput::from_str(
+                d.account.map(|a| format!("{:#x}", Felt::from(a))).unwrap_or_default(),
+            ),
+            private_key: TextInput::from_str(
+                d.private_key.map(|k| format!("{k:#x}")).unwrap_or_default(),
+            ),
+            focused: SettingsField::RpcUrl,
+            editing: false,
+        }
+    }
+
+    /// Validate and convert into an [`ExecutorConfig`]. Returns a list of human-readable
+    /// errors instead of bailing on the first one — better UX in a form.
+    fn build(&self) -> std::result::Result<ExecutorConfig, Vec<String>> {
+        let mut errs = Vec::new();
+        let rpc_url = match Url::parse(self.rpc_url.as_str()) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                errs.push(format!("RPC URL: {e}"));
+                None
+            }
+        };
+        let account = if self.account.is_empty() {
+            errs.push("Account is required".to_string());
+            None
+        } else {
+            match Felt::from_str(self.account.as_str()) {
+                Ok(f) => Some(ContractAddress::from(f)),
+                Err(e) => {
+                    errs.push(format!("Account: {e}"));
+                    None
+                }
+            }
+        };
+        let private_key = if self.private_key.is_empty() {
+            errs.push("Private key is required".to_string());
+            None
+        } else {
+            match Felt::from_str(self.private_key.as_str()) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    errs.push(format!("Private key: {e}"));
+                    None
+                }
+            }
+        };
+        if errs.is_empty() {
+            Ok(ExecutorConfig {
+                rpc_url: rpc_url.unwrap(),
+                account_address: account.unwrap(),
+                private_key: private_key.unwrap(),
+            })
+        } else {
+            Err(errs)
+        }
+    }
+
+    fn focused_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self.focused {
+            SettingsField::RpcUrl => Some(&mut self.rpc_url),
+            SettingsField::Account => Some(&mut self.account),
+            SettingsField::PrivateKey => Some(&mut self.private_key),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Text input widget — cursor + readline-style shortcuts
+// -----------------------------------------------------------------------------
+
+/// A single-line editable text buffer with a cursor position. All edit operations
+/// keep `cursor` on a UTF-8 char boundary so multi-byte input works correctly.
+///
+/// We roll our own instead of pulling in `tui-input` because the surface we need is
+/// small and the alternative is yet another transitive dependency for ~150 lines.
+#[derive(Debug, Default, Clone)]
+struct TextInput {
+    value: String,
+    /// Byte offset of the cursor inside `value`. Always at a char boundary, always
+    /// in `0..=value.len()`.
+    cursor: usize,
+}
+
+impl TextInput {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn from_str(s: impl Into<String>) -> Self {
+        let value = s.into();
+        let cursor = value.len();
+        Self { value, cursor }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    /// Insert a single character at the cursor and advance.
+    fn insert_char(&mut self, c: char) {
+        self.value.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor (Backspace / Ctrl+H).
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Walk backwards to the previous char boundary.
+        let mut new_cursor = self.cursor - 1;
+        while !self.value.is_char_boundary(new_cursor) {
+            new_cursor -= 1;
+        }
+        self.value.replace_range(new_cursor..self.cursor, "");
+        self.cursor = new_cursor;
+    }
+
+    /// Delete the character at the cursor (Delete / Ctrl+D).
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        let mut end = self.cursor + 1;
+        while end < self.value.len() && !self.value.is_char_boundary(end) {
+            end += 1;
+        }
+        self.value.replace_range(self.cursor..end, "");
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let mut c = self.cursor - 1;
+        while !self.value.is_char_boundary(c) {
+            c -= 1;
+        }
+        self.cursor = c;
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        let mut c = self.cursor + 1;
+        while c < self.value.len() && !self.value.is_char_boundary(c) {
+            c += 1;
+        }
+        self.cursor = c;
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
+    /// Delete the word before the cursor (Ctrl+W). Words are runs of non-whitespace.
+    /// First eats trailing whitespace, then a run of non-whitespace — same as bash.
+    fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let bytes = self.value.as_bytes();
+        let mut i = self.cursor;
+        // Eat whitespace.
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        // Eat the word.
+        while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        // Snap to char boundary in case we landed mid-multibyte.
+        while !self.value.is_char_boundary(i) {
+            i -= 1;
+        }
+        self.value.replace_range(i..self.cursor, "");
+        self.cursor = i;
+    }
+
+    /// Delete from the cursor to the start of the line (Ctrl+U).
+    fn kill_to_start(&mut self) {
+        self.value.replace_range(..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    /// Delete from the cursor to the end of the line (Ctrl+K).
+    fn kill_to_end(&mut self) {
+        self.value.truncate(self.cursor);
+    }
+}
+
+/// Apply a key event to a [`TextInput`], handling printable characters, Backspace,
+/// arrow keys, and the standard readline shortcuts (Ctrl+A/E/B/F/H/D/W/U/K).
+///
+/// Returns `true` when the key was consumed by the editor — callers should *not*
+/// fall through to their own keybindings in that case (e.g. don't treat Ctrl+A as
+/// "select all" in some other context). Returns `false` for keys the editor doesn't
+/// recognise (Enter, Esc, Tab, function keys, …) so the caller can handle them.
+fn handle_text_edit(input: &mut TextInput, code: KeyCode, mods: KeyModifiers) -> bool {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+
+    if ctrl {
+        match code {
+            KeyCode::Char('a') => {
+                input.move_home();
+                return true;
+            }
+            KeyCode::Char('e') => {
+                input.move_end();
+                return true;
+            }
+            KeyCode::Char('b') => {
+                input.move_left();
+                return true;
+            }
+            KeyCode::Char('f') => {
+                input.move_right();
+                return true;
+            }
+            KeyCode::Char('h') => {
+                input.backspace();
+                return true;
+            }
+            KeyCode::Char('d') => {
+                input.delete_forward();
+                return true;
+            }
+            KeyCode::Char('w') => {
+                input.delete_word_backward();
+                return true;
+            }
+            KeyCode::Char('u') => {
+                input.kill_to_start();
+                return true;
+            }
+            KeyCode::Char('k') => {
+                input.kill_to_end();
+                return true;
+            }
+            _ => return false,
+        }
+    }
+
+    match code {
+        KeyCode::Char(c) => {
+            input.insert_char(c);
+            true
+        }
+        KeyCode::Backspace => {
+            input.backspace();
+            true
+        }
+        KeyCode::Delete => {
+            input.delete_forward();
+            true
+        }
+        KeyCode::Left => {
+            input.move_left();
+            true
+        }
+        KeyCode::Right => {
+            input.move_right();
+            true
+        }
+        KeyCode::Home => {
+            input.move_home();
+            true
+        }
+        KeyCode::End => {
+            input.move_end();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Render a focused [`TextInput`] as three styled spans (`before`, `at_cursor`, `after`)
+/// so the cursor is visually distinct without needing real terminal cursor positioning.
+/// When the cursor is past the end of the buffer, an extra space is highlighted to
+/// give the user something to see.
+fn render_text_input<'a>(input: &'a TextInput, focused: bool, mask: bool) -> Vec<Span<'a>> {
+    let display: String =
+        if mask { "*".repeat(input.value.chars().count()) } else { input.value.clone() };
+
+    if !focused {
+        return vec![Span::raw(display)];
+    }
+
+    // For masked inputs, project the cursor by char count rather than bytes.
+    let (before, at, after) = if mask {
+        let chars: Vec<char> = display.chars().collect();
+        let cursor_chars = input.value[..input.cursor].chars().count().min(chars.len());
+        let before: String = chars[..cursor_chars].iter().collect();
+        let at = chars.get(cursor_chars).copied();
+        let after: String = chars.get(cursor_chars + 1..).into_iter().flatten().collect();
+        (before, at, after)
+    } else {
+        let before = input.value[..input.cursor].to_string();
+        let mut after_chars = input.value[input.cursor..].chars();
+        let at = after_chars.next();
+        let after = after_chars.as_str().to_string();
+        (before, at, after)
+    };
+
+    let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+    let mut spans = vec![Span::raw(before)];
+    match at {
+        Some(c) => spans.push(Span::styled(c.to_string(), cursor_style)),
+        None => spans.push(Span::styled(" ", cursor_style)),
+    }
+    spans.push(Span::raw(after));
+    spans
+}
+
+// -----------------------------------------------------------------------------
+// Fuzzy file search (used by the AddClassFile modal)
+// -----------------------------------------------------------------------------
+
+/// Soft cap on the number of files we're willing to fuzzy-search over. In huge repos
+/// the cwd walk would otherwise stall the UI thread when the modal opens.
+const FILE_SEARCH_MAX_CANDIDATES: usize = 20_000;
+
+/// Recursive depth limit for the cwd walk. 8 is enough to reach Sierra artifacts in
+/// any reasonable nested project layout (e.g. `target/dev/foo.contract_class.json`)
+/// without paying for arbitrarily deep `node_modules`-style trees.
+const FILE_SEARCH_MAX_DEPTH: usize = 8;
+
+/// Number of matches to keep in the visible list — anything beyond this is dropped
+/// before rendering, since the modal area only shows so many lines anyway.
+const FILE_SEARCH_VISIBLE: usize = 20;
+
+/// How long to wait between the last keystroke and actually re-scoring the candidate
+/// list. Short enough that the result list feels responsive, long enough that fast
+/// typing doesn't cause a re-render storm.
+const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+
+#[derive(Debug)]
+struct FileSearch {
+    /// Raw query as the user has typed it. While the query is empty the matches list
+    /// is intentionally also empty — we don't want to dump cwd into the user's face
+    /// before they've expressed any intent.
+    query: TextInput,
+    /// All `*.json` files found under cwd at modal-open time. Cached for the lifetime
+    /// of the modal so re-scoring is cheap on every keystroke.
+    candidates: Vec<PathBuf>,
+    /// Current results. Recomputed lazily after the debounce window expires.
+    matches: Vec<(PathBuf, i64)>,
+    /// Index into `matches`. Always valid when `matches` is non-empty.
+    selected: usize,
+    /// Root we walked from — surfaced in the modal title so the user knows where the
+    /// candidate list came from.
+    root: PathBuf,
+    /// Set to `Some(deadline)` when the query has been mutated since the last recompute.
+    /// The TUI event loop's tick checks this each iteration and runs `recompute` once
+    /// the deadline has passed, so fast typing doesn't trigger one full match-and-sort
+    /// pass per keystroke.
+    pending_recompute: Option<Instant>,
+}
+
+impl FileSearch {
+    /// Walk cwd and build the candidate list. Cheap-ish: we filter aggressively (only
+    /// `*.json`, only at depth ≤ 8, ignoring obvious heavy directories).
+    fn open() -> Self {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let candidates = walk_json_files(&root);
+        Self {
+            query: TextInput::new(),
+            candidates,
+            matches: Vec::new(),
+            selected: 0,
+            root,
+            pending_recompute: None,
+        }
+    }
+
+    /// Mark the query as dirty; the actual recompute happens later via [`Self::tick`]
+    /// once the debounce window elapses. Callers don't need to know about the timer.
+    fn mark_dirty(&mut self) {
+        self.pending_recompute = Some(Instant::now() + FILE_SEARCH_DEBOUNCE);
+    }
+
+    /// Called from the event loop on every tick. If a recompute is pending and its
+    /// deadline has passed, run it. Returns `true` if a recompute actually happened
+    /// (so the caller can know it should redraw, though we draw every tick anyway).
+    fn tick(&mut self, now: Instant) -> bool {
+        match self.pending_recompute {
+            Some(when) if now >= when => {
+                self.recompute();
+                self.pending_recompute = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-derive matches from the current query. Public so tests can drive it
+    /// synchronously without faking time.
+    fn recompute(&mut self) {
+        let prev = self.matches.get(self.selected).map(|(p, _)| p.clone());
+        self.matches.clear();
+
+        // Empty query → empty results. Showing the entire walked tree before the user
+        // has typed anything is noisy and almost never what they want.
+        if self.query.is_empty() {
+            self.selected = 0;
+            return;
+        }
+
+        for path in &self.candidates {
+            let display = path.to_string_lossy();
+            if let Some(score) = fuzzy_score(self.query.as_str(), &display) {
+                self.matches.push((path.clone(), score));
+            }
+        }
+        // Higher score first; on a tie prefer the shorter (more specific) path.
+        self.matches.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| a.0.as_os_str().len().cmp(&b.0.as_os_str().len()))
+        });
+        self.matches.truncate(FILE_SEARCH_VISIBLE);
+
+        // Try to keep the same row highlighted across recomputes when possible — UX
+        // sanity so the cursor doesn't jump every keystroke.
+        self.selected =
+            prev.and_then(|p| self.matches.iter().position(|(m, _)| *m == p)).unwrap_or(0);
+    }
+
+    fn move_down(&mut self) {
+        if !self.matches.is_empty() && self.selected + 1 < self.matches.len() {
+            self.selected += 1;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// What `Enter` should load. Highlighted match wins; if there are no matches but
+    /// the query as-typed parses to a real file (e.g. an absolute path the user
+    /// pasted), fall back to that. Returns `None` when nothing is loadable.
+    fn resolve_choice(&self) -> Option<PathBuf> {
+        if let Some((path, _)) = self.matches.get(self.selected) {
+            return Some(path.clone());
+        }
+        let trimmed = self.query.as_str().trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let pb = expand_tilde(trimmed);
+        if pb.is_file() {
+            Some(pb)
+        } else {
+            None
+        }
+    }
+}
+
+fn walk_json_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= FILE_SEARCH_MAX_CANDIDATES {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Skip hidden + obvious heavy directories — these are almost never where
+            // the user keeps their compiled Sierra artifacts and walking them would
+            // dwarf the rest of the search.
+            if name.starts_with('.') {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if matches!(name, "target" | "node_modules" | "build" | "dist") {
+                    continue;
+                }
+                if depth + 1 < FILE_SEARCH_MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "json") {
+                out.push(path);
+                if out.len() >= FILE_SEARCH_MAX_CANDIDATES {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Tiny inline fuzzy scorer: classic subsequence match (case-insensitive) with a
+/// bonus for adjacent characters and a penalty for long candidates. Returns `None`
+/// when the query isn't a subsequence of the candidate. Good enough for a v1 file
+/// picker — if we ever want word-boundary or camelCase bonuses, drop in
+/// `fuzzy-matcher`'s `SkimMatcherV2` and delete this.
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let mut q_idx = 0usize;
+    let mut score: i64 = 0;
+    let mut last_match: Option<usize> = None;
+    for (i, ch) in candidate.to_lowercase().chars().enumerate() {
+        if q_idx >= q.len() {
+            break;
+        }
+        if ch == q[q_idx] {
+            // +10 for adjacent matches, +1 for any other match.
+            if last_match == Some(i.wrapping_sub(1)) {
+                score += 10;
+            } else {
+                score += 1;
+            }
+            last_match = Some(i);
+            q_idx += 1;
+        }
+    }
+    if q_idx < q.len() {
+        return None;
+    }
+    // Penalize long candidates so a query that matches both `foo.json` and
+    // `path/to/foo.json` ranks the former higher.
+    Some(score * 5 - candidate.len() as i64)
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(s).into_owned())
+}
+
+// -----------------------------------------------------------------------------
+// Modals
+// -----------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Modal {
+    /// Pick an embedded class to declare, or open the file-load sub-modal.
+    AddClassPicker {
+        picker_state: ListState,
+        /// In-modal status line. Set when the user clicks an entry that's already in
+        /// the plan, so the dup notice shows up at the bottom of the picker instead
+        /// of in the global flash bar.
+        info: Option<String>,
+    },
+    /// Fuzzy file picker for loading a Sierra class JSON from disk. The user types
+    /// a query and we live-filter the cached file list as they go; absolute paths
+    /// (starting with `/` or `~`) bypass fuzzy matching and are treated as literal.
+    AddClassFile { search: FileSearch, error: Option<String> },
+
+    /// Dedicated "compiling…" modal that takes over once the user picks a file in
+    /// [`Modal::AddClassFile`]. The actual parse + Sierra→CASM compile runs on a
+    /// background thread; this modal exists to communicate that work to the user.
+    /// On success the modal closes; on failure (or Esc) we restore the prior
+    /// `AddClassFile` modal so the user keeps their search context.
+    LoadingClass {
+        pending: PendingLoad,
+        /// The search state we came from. Restored verbatim on cancel/failure so the
+        /// user doesn't have to retype their query and pick the file again.
+        return_to_search: FileSearch,
+        /// In-modal notice. Set after the worker completes when the freshly-loaded
+        /// class turns out to already be in the plan — the spinner is replaced by
+        /// this message and Esc dismisses the modal entirely.
+        notice: Option<String>,
+    },
+    /// Add or edit a deploy. `editing_index = Some(i)` means we're editing in place.
+    ContractForm { editing_index: Option<usize>, form: ContractForm },
+    /// Save manifest path prompt shown after successful execution.
+    SaveManifest { path: TextInput, error: Option<String> },
+}
+
+/// Background load handle for the AddClassFile modal. The worker thread does the
+/// expensive `parse + class_hash + casm_compile` chain, then ships the result back
+/// to the UI thread via a sync channel that we drain on every event-loop tick.
+#[derive(Debug)]
+struct PendingLoad {
+    /// The path being loaded — surfaced in the modal so the user knows what's spinning.
+    path: PathBuf,
+    /// One-shot result channel. The worker writes once and disconnects.
+    rx: std::sync::mpsc::Receiver<Result<DeclareStep>>,
+    /// Wall-clock start time, used to drive the spinner frame.
+    started: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractField {
+    Class,
+    Label,
+    Salt,
+    Unique,
+    Calldata,
+}
+
+impl ContractField {
+    const ALL: [ContractField; 5] = [
+        ContractField::Class,
+        ContractField::Label,
+        ContractField::Salt,
+        ContractField::Unique,
+        ContractField::Calldata,
+    ];
+
+    fn idx(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap()
+    }
+    fn next(self) -> Self {
+        Self::ALL[(self.idx() + 1) % Self::ALL.len()]
+    }
+    fn prev(self) -> Self {
+        Self::ALL[(self.idx() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ContractField::Class => "Class",
+            ContractField::Label => "Label",
+            ContractField::Salt => "Salt",
+            ContractField::Unique => "Unique",
+            ContractField::Calldata => "Calldata",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ContractForm {
+    /// Index into the resolved class options list (declared + embedded).
+    class_idx: usize,
+    label: TextInput,
+    salt: TextInput,
+    unique: bool,
+    calldata: TextInput,
+    focused: ContractField,
+    error: Option<String>,
+}
+
+impl ContractForm {
+    fn new() -> Self {
+        Self {
+            class_idx: 0,
+            label: TextInput::new(),
+            salt: TextInput::from_str("0x0"),
+            unique: false,
+            calldata: TextInput::new(),
+            focused: ContractField::Class,
+            error: None,
+        }
+    }
+
+    fn from_existing(step: &DeployStep, class_options: &[ClassOption]) -> Self {
+        let class_idx = class_options.iter().position(|o| o.name == step.class_name).unwrap_or(0);
+        Self {
+            class_idx,
+            label: TextInput::from_str(step.label.clone().unwrap_or_default()),
+            salt: TextInput::from_str(format!("{:#x}", step.salt)),
+            unique: step.unique,
+            calldata: TextInput::from_str(
+                step.calldata.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(", "),
+            ),
+            focused: ContractField::Class,
+            error: None,
+        }
+    }
+
+    fn build(&self, class_options: &[ClassOption]) -> std::result::Result<DeployStep, String> {
+        if class_options.is_empty() {
+            return Err("no classes available — add one in the Classes tab first".to_string());
+        }
+        let class = &class_options[self.class_idx];
+        let salt = Felt::from_str(self.salt.as_str().trim()).map_err(|e| format!("salt: {e}"))?;
+        let calldata = if self.calldata.as_str().trim().is_empty() {
+            Vec::new()
+        } else {
+            self.calldata
+                .as_str()
+                .split(',')
+                .map(|s| Felt::from_str(s.trim()).map_err(|e| format!("calldata `{s}`: {e}")))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(DeployStep {
+            label: if self.label.is_empty() { None } else { Some(self.label.as_str().to_string()) },
+            class_hash: class.class_hash,
+            class_name: class.name.clone(),
+            salt,
+            unique: self.unique,
+            calldata,
+        })
+    }
+
+    /// Mutable handle to whichever field is currently focused, used by the modal
+    /// keyboard handler to forward edit ops generically.
+    fn focused_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self.focused {
+            ContractField::Label => Some(&mut self.label),
+            ContractField::Salt => Some(&mut self.salt),
+            ContractField::Calldata => Some(&mut self.calldata),
+            ContractField::Class | ContractField::Unique => None,
+        }
+    }
+}
+
+/// One row in the class picker that the contract form uses. Built fresh from the
+/// app's classes + embedded registry whenever the modal opens, so it always reflects
+/// the current declared set.
+#[derive(Debug, Clone)]
+struct ClassOption {
+    name: String,
+    class_hash: katana_primitives::class::ClassHash,
+}
+
+fn class_options(app: &AppState) -> Vec<ClassOption> {
+    let mut out: Vec<ClassOption> = app
+        .classes
+        .iter()
+        .map(|c| ClassOption { name: c.name.clone(), class_hash: c.class_hash })
+        .collect();
+    for entry in embedded::REGISTRY {
+        if !out.iter().any(|o| o.name == entry.name) {
+            out.push(ClassOption { name: entry.name.to_string(), class_hash: entry.class_hash });
+        }
+    }
+    out
+}
+
+// -----------------------------------------------------------------------------
+// Execution state
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowStatus {
+    Pending,
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecKind {
+    Declare,
+    Deploy,
+}
+
+impl ExecKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExecKind::Declare => "declare",
+            ExecKind::Deploy => "deploy",
+        }
+    }
+}
+
+/// One row of the Execute tab. The structured fields exist so the renderer can
+/// compute column widths once across all rows and pad each cell to that width —
+/// otherwise the trailing detail (hash/address/error) would zig-zag with the
+/// length of every primary/secondary field.
+#[derive(Debug, Clone)]
+struct ExecRow {
+    kind: ExecKind,
+    /// Declare: the local class alias. Deploy: the contract label.
+    primary: String,
+    /// Deploy-only: the class the contract is deploying. `None` for declares.
+    secondary: Option<String>,
+    status: RowStatus,
+}
+
+enum ExecutionState {
+    Idle,
+    Running {
+        rx: UnboundedReceiver<BootstrapEvent>,
+        /// Handle to the executor task. We keep it for ownership / cleanup; completion
+        /// is detected via the terminal `Done`/`Failed` events on `rx`, not by polling
+        /// the join handle (which would force us to drag a runtime handle into draining).
+        _handle: JoinHandle<Result<BootstrapReport>>,
+        rows: Vec<ExecRow>,
+        tick: u64,
+    },
+    Done {
+        rows: Vec<ExecRow>,
+        result: std::result::Result<BootstrapReport, String>,
+    },
+}
+
+impl std::fmt::Debug for ExecutionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::Running { rows, tick, .. } => {
+                write!(f, "Running({} rows, tick={tick})", rows.len())
+            }
+            Self::Done { result, .. } => write!(f, "Done(ok={})", result.is_ok()),
+        }
+    }
+}
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// =============================================================================
+// Event loop
+// =============================================================================
+
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| draw_app(f, app))?;
+
+        if app.quit {
+            return Ok(());
+        }
+
+        // Drain any pending progress events without blocking, so the spinner ticks
+        // and the rows update on the next draw.
+        drain_progress(app);
+
+        // Tick any background work attached to the current modal:
+        //
+        // 1. AddClassFile fuzzy search debounce — schedules a recompute once the user has stopped
+        //    typing for `FILE_SEARCH_DEBOUNCE`.
+        // 2. LoadingClass receiver — drains the background loader's result if ready; on success
+        //    closes the modal and adds the class, on failure transitions back to AddClassFile with
+        //    the error attached and the previous search state preserved.
+        if let Some(Modal::AddClassFile { search, .. }) = app.modal.as_mut() {
+            search.tick(Instant::now());
+        }
+        let mut completed_load: Option<Result<DeclareStep>> = None;
+        if let Some(Modal::LoadingClass { pending, notice, .. }) = app.modal.as_mut() {
+            // Once a `notice` has been set the load is already settled — the worker
+            // thread has dropped its sender, so a fresh `try_recv` would return
+            // `Disconnected` and we'd misreport that as "thread vanished without
+            // sending a result". Skip the drain entirely in that state.
+            if notice.is_none() {
+                match pending.rx.try_recv() {
+                    Ok(result) => completed_load = Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {} // still loading
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        completed_load = Some(Err(anyhow!(
+                            "background class loader thread disconnected without sending a result"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(result) = completed_load {
+            // Take the modal so we can move out of `return_to_search` on failure
+            // or transition the modal in place on success.
+            let modal = app.modal.take();
+            match (result, modal) {
+                (Ok(step), Some(Modal::LoadingClass { pending, return_to_search, .. })) => {
+                    // Dedup by class hash. We can only do this *after* loading
+                    // because the hash isn't known until the Sierra has been parsed
+                    // and compiled — by which point the worker has already paid the
+                    // CPU cost. That's fine: dedup is best-effort, and the rare case
+                    // of paying for a redundant compile is preferable to either
+                    // blocking on a synchronous pre-load or letting duplicate
+                    // declares slip through.
+                    let dup = app.classes.iter().any(|c| c.class_hash == step.class_hash);
+                    if dup {
+                        // Stay in the LoadingClass modal but swap the spinner for an
+                        // inline notice. The user dismisses with Esc.
+                        app.modal = Some(Modal::LoadingClass {
+                            pending,
+                            return_to_search,
+                            notice: Some("Class is already selected".to_string()),
+                        });
+                    } else {
+                        app.classes.push(step);
+                        app.classes_state.select(Some(app.classes.len() - 1));
+                        // Modal closed by `take()` — class added to the plan.
+                    }
+                }
+                (Ok(_), other) => {
+                    // Defensive: completed_load should only be Ok when the modal is
+                    // LoadingClass. If we somehow get here, restore whatever modal
+                    // was up and drop the result.
+                    app.modal = other;
+                }
+                (Err(err), Some(Modal::LoadingClass { return_to_search, .. })) => {
+                    app.modal = Some(Modal::AddClassFile {
+                        search: return_to_search,
+                        error: Some(err.to_string()),
+                    });
+                }
+                (Err(err), other) => {
+                    // Defensive: completed_load should only be set when the modal
+                    // is LoadingClass. Surface the error via the global flash bar
+                    // since we have nowhere better to put it.
+                    app.flash(format!("background load error: {err}"));
+                    app.modal = other;
+                }
+            }
+        }
+
+        // Poll for keyboard input with a short timeout — short enough that the spinner
+        // looks alive (~16fps), long enough to avoid hot-spinning the CPU.
+        if event::poll(Duration::from_millis(60))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                handle_key(app, key.code, key.modifiers, runtime);
+            }
+        } else if let ExecutionState::Running { tick, .. } = &mut app.execution {
+            // No input → still tick the spinner so the running view animates.
+            *tick = tick.wrapping_add(1);
+        }
+    }
+}
+
+fn drain_progress(app: &mut AppState) {
+    // We need both the rows (mutable) and the classes len (immutable) at the same time,
+    // so split the borrow up front.
+    let classes_len = app.classes.len();
+    let ExecutionState::Running { rx, rows, .. } = &mut app.execution else {
+        return;
+    };
+
+    // Collect terminal events as we go so we can transition state after the drain loop
+    // (the borrow checker would otherwise complain about reassigning `app.execution`).
+    let mut terminal: Option<std::result::Result<BootstrapReport, String>> = None;
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            BootstrapEvent::DeclareStarted { idx, .. } => {
+                if let Some(row) = rows.get_mut(idx) {
+                    row.status = RowStatus::Running;
+                }
+            }
+            BootstrapEvent::DeclareCompleted { idx, class_hash, already_declared, .. } => {
+                if let Some(row) = rows.get_mut(idx) {
+                    let suffix = if already_declared { " (already)" } else { "" };
+                    row.status = RowStatus::Done(format!("{class_hash:#x}{suffix}"));
+                }
+            }
+            BootstrapEvent::DeployStarted { idx, .. } => {
+                let row_idx = classes_len + idx;
+                if let Some(row) = rows.get_mut(row_idx) {
+                    row.status = RowStatus::Running;
+                }
+            }
+            BootstrapEvent::DeployCompleted { idx, address, already_deployed, .. } => {
+                let row_idx = classes_len + idx;
+                if let Some(row) = rows.get_mut(row_idx) {
+                    let suffix = if already_deployed { " (already)" } else { "" };
+                    row.status = RowStatus::Done(format!("{:#x}{suffix}", Felt::from(address)));
+                }
+            }
+            BootstrapEvent::Failed { error } => {
+                if let Some(row) = rows.iter_mut().find(|r| r.status == RowStatus::Running) {
+                    row.status = RowStatus::Failed(error.clone());
+                }
+                terminal = Some(Err(error));
+            }
+            BootstrapEvent::Done { report } => {
+                terminal = Some(Ok(report));
+            }
+        }
+    }
+
+    if let Some(result) = terminal {
+        let prev = std::mem::replace(&mut app.execution, ExecutionState::Idle);
+        if let ExecutionState::Running { rows, .. } = prev {
+            app.execution = ExecutionState::Done { rows, result };
+        }
+    }
+}
+
+// =============================================================================
+// Input handling
+// =============================================================================
+
+fn handle_key(
+    app: &mut AppState,
+    code: KeyCode,
+    mods: KeyModifiers,
+    runtime: &tokio::runtime::Handle,
+) {
+    // Global Ctrl+C: hard quit no matter what's focused.
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        app.quit = true;
+        return;
+    }
+
+    app.flash = None;
+
+    // Modal-first: if a modal is up, route input to it.
+    if app.modal.is_some() {
+        handle_modal_key(app, code, mods);
+        return;
+    }
+
+    // Global tab navigation (only when no modal is open).
+    if code == KeyCode::Tab {
+        app.current_tab = app.current_tab.next();
+        return;
+    }
+    if code == KeyCode::BackTab {
+        app.current_tab = app.current_tab.prev();
+        return;
+    }
+
+    match app.current_tab {
+        Tab::Classes => handle_classes_key(app, code),
+        Tab::Contracts => handle_contracts_key(app, code),
+        Tab::Settings => handle_settings_key(app, code, mods),
+        Tab::Execute => handle_execute_key(app, code, runtime),
+    }
+}
+
+fn handle_classes_key(app: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Char('a') => {
+            app.modal =
+                Some(Modal::AddClassPicker { picker_state: ListState::default(), info: None });
+        }
+        KeyCode::Char('d') => {
+            if let Some(i) = app.classes_state.selected() {
+                if i < app.classes.len() {
+                    let removed = app.classes.remove(i);
+                    if app.contracts.iter().any(|c| c.class_name == removed.name) {
+                        app.flash(format!(
+                            "warning: deleted class `{}` is referenced by a deploy",
+                            removed.name
+                        ));
+                    }
+                    if app.classes.is_empty() {
+                        app.classes_state.select(None);
+                    } else if i >= app.classes.len() {
+                        app.classes_state.select(Some(app.classes.len() - 1));
+                    }
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            move_list(&mut app.classes_state, app.classes.len(), 1)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            move_list(&mut app.classes_state, app.classes.len(), -1)
+        }
+        _ => {}
+    }
+}
+
+fn handle_contracts_key(app: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Char('a') => {
+            app.modal =
+                Some(Modal::ContractForm { editing_index: None, form: ContractForm::new() });
+        }
+        KeyCode::Char('e') => {
+            if let Some(i) = app.contracts_state.selected() {
+                if let Some(existing) = app.contracts.get(i) {
+                    let opts = class_options(app);
+                    app.modal = Some(Modal::ContractForm {
+                        editing_index: Some(i),
+                        form: ContractForm::from_existing(existing, &opts),
+                    });
+                }
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(i) = app.contracts_state.selected() {
+                if i < app.contracts.len() {
+                    app.contracts.remove(i);
+                    if app.contracts.is_empty() {
+                        app.contracts_state.select(None);
+                    } else if i >= app.contracts.len() {
+                        app.contracts_state.select(Some(app.contracts.len() - 1));
+                    }
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            move_list(&mut app.contracts_state, app.contracts.len(), 1)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            move_list(&mut app.contracts_state, app.contracts.len(), -1)
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) {
+    if app.settings.editing {
+        // Esc / Enter exit edit mode; everything else is forwarded to the focused
+        // text input via the standard readline-style editor.
+        if matches!(code, KeyCode::Esc | KeyCode::Enter) {
+            app.settings.editing = false;
+            return;
+        }
+        if let Some(input) = app.settings.focused_input_mut() {
+            handle_text_edit(input, code, mods);
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.settings.focused = app.settings.focused.next();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.settings.focused = app.settings.focused.prev();
+        }
+        KeyCode::Enter | KeyCode::Char('e') => {
+            app.settings.editing = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_execute_key(app: &mut AppState, code: KeyCode, runtime: &tokio::runtime::Handle) {
+    match code {
+        KeyCode::Char('q') => {
+            // Don't allow quit while a task is mid-flight; the executor isn't cancellable.
+            if matches!(app.execution, ExecutionState::Running { .. }) {
+                app.flash("execution in progress — wait for it to finish");
+            } else {
+                app.quit = true;
+            }
+        }
+        KeyCode::Esc => {
+            if matches!(app.execution, ExecutionState::Running { .. }) {
+                app.flash("execution in progress — wait for it to finish");
+            } else {
+                app.quit = true;
+            }
+        }
+        KeyCode::Char('x') => {
+            if matches!(app.execution, ExecutionState::Running { .. }) {
+                app.flash("already running");
+                return;
+            }
+            start_execution(app, runtime);
+        }
+        KeyCode::Char('s') => {
+            if matches!(&app.execution, ExecutionState::Done { result: Ok(_), .. }) {
+                app.modal = Some(Modal::SaveManifest {
+                    path: TextInput::from_str("./bootstrap.toml"),
+                    error: None,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn start_execution(app: &mut AppState, runtime: &tokio::runtime::Handle) {
+    if app.classes.is_empty() && app.contracts.is_empty() {
+        app.flash("nothing to do — add a class or contract first");
+        return;
+    }
+    let cfg = match app.settings.build() {
+        Ok(c) => c,
+        Err(errs) => {
+            app.flash(format!("settings invalid: {}", errs.join("; ")));
+            app.current_tab = Tab::Settings;
+            return;
+        }
+    };
+
+    let plan = BootstrapPlan { declares: app.classes.clone(), deploys: app.contracts.clone() };
+
+    // Build the per-row state up front from the plan, so the user sees every step
+    // queued before any of them run.
+    let mut rows: Vec<ExecRow> = Vec::with_capacity(plan.declares.len() + plan.deploys.len());
+    for d in &plan.declares {
+        rows.push(ExecRow {
+            kind: ExecKind::Declare,
+            primary: d.name.clone(),
+            secondary: None,
+            status: RowStatus::Pending,
+        });
+    }
+    for d in &plan.deploys {
+        rows.push(ExecRow {
+            kind: ExecKind::Deploy,
+            primary: d.label.clone().unwrap_or_else(|| "-".to_string()),
+            secondary: Some(d.class_name.clone()),
+            status: RowStatus::Pending,
+        });
+    }
+
+    let (tx, rx) = unbounded_channel();
+    let plan_arc = Arc::new(plan);
+    let cfg_arc = Arc::new(cfg);
+    let plan_for_task = plan_arc.clone();
+    let cfg_for_task = cfg_arc.clone();
+    let handle: JoinHandle<Result<BootstrapReport>> = runtime
+        .spawn(async move { execute_with_progress(&plan_for_task, &cfg_for_task, Some(tx)).await });
+
+    app.execution = ExecutionState::Running { rx, _handle: handle, rows, tick: 0 };
+}
+
+// -----------------------------------------------------------------------------
+// Modal input handling
+// -----------------------------------------------------------------------------
+
+fn handle_modal_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) {
+    // Take ownership so we can mutate the modal and then put it back, avoiding nested
+    // borrows of `app`.
+    let Some(modal) = app.modal.take() else { return };
+    match modal {
+        Modal::AddClassPicker { mut picker_state, info: _ } => {
+            // Picker entries: every embedded class + a final "Load from file…" row.
+            let total = embedded::REGISTRY.len() + 1;
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // discard
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    move_list(&mut picker_state, total, 1);
+                    // Moving the cursor clears any stale "already in plan" notice;
+                    // it'd be confusing to keep showing it for an entry the user
+                    // is no longer hovering.
+                    app.modal = Some(Modal::AddClassPicker { picker_state, info: None });
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    move_list(&mut picker_state, total, -1);
+                    app.modal = Some(Modal::AddClassPicker { picker_state, info: None });
+                }
+                KeyCode::Enter => {
+                    let i = picker_state.selected().unwrap_or(0);
+                    if i < embedded::REGISTRY.len() {
+                        let entry = &embedded::REGISTRY[i];
+                        // Manual dup check so we can keep the modal open and show
+                        // the message inline. We deliberately don't reuse
+                        // `push_embedded_class`'s flash-based path here.
+                        let already = app.classes.iter().any(|c| c.class_hash == entry.class_hash);
+                        if already {
+                            app.modal = Some(Modal::AddClassPicker {
+                                picker_state,
+                                info: Some("Class is already selected".to_string()),
+                            });
+                        } else {
+                            push_embedded_class(app, entry);
+                        }
+                    } else {
+                        // "Load from file…" → switch modals (cwd walk happens here).
+                        app.modal =
+                            Some(Modal::AddClassFile { search: FileSearch::open(), error: None });
+                    }
+                }
+                _ => {
+                    app.modal = Some(Modal::AddClassPicker { picker_state, info: None });
+                }
+            }
+        }
+        Modal::AddClassFile { mut search, error: _ } => match code {
+            KeyCode::Esc => {} // discard
+            KeyCode::Enter => match search.resolve_choice() {
+                Some(pb) => {
+                    // Spawn the parse + compile on a worker thread and transition to
+                    // the dedicated LoadingClass modal carrying the previous search
+                    // state — so the user lands back here on cancel or failure.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let path_for_task = pb.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(load_class_file(&path_for_task));
+                    });
+                    app.modal = Some(Modal::LoadingClass {
+                        pending: PendingLoad { path: pb, rx, started: Instant::now() },
+                        return_to_search: search,
+                        notice: None,
+                    });
+                }
+                None => {
+                    app.modal = Some(Modal::AddClassFile {
+                        search,
+                        error: Some("no match — keep typing or press Esc".to_string()),
+                    });
+                }
+            },
+            KeyCode::Down => {
+                search.move_down();
+                app.modal = Some(Modal::AddClassFile { search, error: None });
+            }
+            KeyCode::Up => {
+                search.move_up();
+                app.modal = Some(Modal::AddClassFile { search, error: None });
+            }
+            _ => {
+                // Forward everything else to the readline-style editor. Mark the
+                // search as dirty so the debounce timer in the event-loop tick picks
+                // it up — fast typing then only triggers one fuzzy pass per pause.
+                if handle_text_edit(&mut search.query, code, mods) {
+                    search.mark_dirty();
+                }
+                app.modal = Some(Modal::AddClassFile { search, error: None });
+            }
+        },
+        Modal::LoadingClass { pending, return_to_search, notice } => {
+            // Loading is non-interactive: every key except Esc is dropped, since
+            // there's nothing to do until the worker thread finishes (or, in the
+            // duplicate-class notice state, until the user dismisses).
+            //
+            // Esc semantics depend on whether the modal is showing a duplicate
+            // notice or still spinning:
+            //   - Notice visible → close the modal entirely (job is done, the user just saw the
+            //     result, sending them back to the search would feel redundant).
+            //   - Still loading → restore the previous AddClassFile so the user can pick a
+            //     different file. The worker thread keeps running and its eventual send into the
+            //     dropped receiver is a no-op.
+            if code == KeyCode::Esc {
+                if notice.is_some() {
+                    // discard — modal closed
+                } else {
+                    app.modal = Some(Modal::AddClassFile { search: return_to_search, error: None });
+                }
+            } else {
+                app.modal = Some(Modal::LoadingClass { pending, return_to_search, notice });
+            }
+        }
+        Modal::ContractForm { editing_index, mut form } => {
+            // Reconstruct the class options every keystroke so the form always reflects
+            // the up-to-date set (in case the user added classes elsewhere).
+            let opts = class_options(app);
+            match code {
+                KeyCode::Esc => {} // discard
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focused = form.focused.next();
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focused = form.focused.prev();
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+                KeyCode::Left if form.focused == ContractField::Class => {
+                    if !opts.is_empty() {
+                        form.class_idx = (form.class_idx + opts.len() - 1) % opts.len();
+                    }
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+                KeyCode::Right if form.focused == ContractField::Class => {
+                    if !opts.is_empty() {
+                        form.class_idx = (form.class_idx + 1) % opts.len();
+                    }
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+                KeyCode::Char(' ') if form.focused == ContractField::Unique => {
+                    form.unique = !form.unique;
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+                KeyCode::Enter => match form.build(&opts) {
+                    Ok(step) => match editing_index {
+                        Some(i) => {
+                            if let Some(slot) = app.contracts.get_mut(i) {
+                                *slot = step;
+                            }
+                        }
+                        None => {
+                            app.contracts.push(step);
+                            app.contracts_state.select(Some(app.contracts.len() - 1));
+                        }
+                    },
+                    Err(e) => {
+                        form.error = Some(e);
+                        app.modal = Some(Modal::ContractForm { editing_index, form });
+                    }
+                },
+                _ => {
+                    // Forward to the focused text input (label/salt/calldata). Class
+                    // and Unique fields don't accept text input, so the helper just
+                    // does nothing for them.
+                    if let Some(input) = form.focused_input_mut() {
+                        handle_text_edit(input, code, mods);
+                    }
+                    app.modal = Some(Modal::ContractForm { editing_index, form });
+                }
+            }
+        }
+        Modal::SaveManifest { mut path, error: _ } => match code {
+            KeyCode::Esc => {} // discard
+            KeyCode::Enter => match save_manifest_from_app(app, path.as_str()) {
+                Ok(()) => {
+                    app.flash(format!("manifest saved to {}", path.as_str()));
+                }
+                Err(e) => {
+                    app.modal = Some(Modal::SaveManifest { path, error: Some(e.to_string()) });
+                }
+            },
+            _ => {
+                handle_text_edit(&mut path, code, mods);
+                app.modal = Some(Modal::SaveManifest { path, error: None });
+            }
+        },
+    }
+}
+
+fn push_embedded_class(app: &mut AppState, entry: &'static EmbeddedClass) {
+    // Dedupe by class hash, not name: two embedded entries that happen to share the
+    // same alias would still be unique on disk, and conversely the same class loaded
+    // under a different alias is still a duplicate as far as the chain is concerned.
+    if app.classes.iter().any(|c| c.class_hash == entry.class_hash) {
+        app.flash("Class is already selected");
+        return;
+    }
+    app.classes.push(DeclareStep {
+        name: entry.name.to_string(),
+        class: Arc::new(entry.class()),
+        class_hash: entry.class_hash,
+        casm_hash: entry.casm_hash,
+        source: ClassSource::Embedded(entry.name),
+    });
+    app.classes_state.select(Some(app.classes.len() - 1));
+}
+
+fn load_class_file(path: &std::path::Path) -> Result<DeclareStep> {
+    if !path.is_file() {
+        return Err(anyhow!("file does not exist"));
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let class = ContractClass::from_str(&raw)?;
+    if class.is_legacy() {
+        return Err(anyhow!("legacy (Cairo 0) classes are not supported"));
+    }
+    let class_hash = class.class_hash()?;
+    let casm_hash = class.clone().compile()?.class_hash()?;
+    let alias = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{class_hash:#x}"));
+    Ok(DeclareStep {
+        name: alias,
+        class: Arc::new(class),
+        class_hash,
+        casm_hash,
+        source: ClassSource::File(path.to_path_buf()),
+    })
+}
+
+fn save_manifest_from_app(app: &AppState, path: &str) -> Result<()> {
+    let manifest = build_manifest_from_app(app);
+    let serialized = toml::to_string_pretty(&manifest)?;
+    std::fs::write(path, serialized)?;
+    Ok(())
+}
+
+fn build_manifest_from_app(app: &AppState) -> Manifest {
+    let classes = app
+        .classes
+        .iter()
+        .map(|d| match &d.source {
+            ClassSource::Embedded(name) => {
+                ClassEntry { name: d.name.clone(), embedded: Some((*name).to_string()), path: None }
+            }
+            ClassSource::File(path) => {
+                ClassEntry { name: d.name.clone(), embedded: None, path: Some(path.clone()) }
+            }
+        })
+        .collect();
+    let contracts = app
+        .contracts
+        .iter()
+        .map(|d| ContractEntry {
+            class: d.class_name.clone(),
+            label: d.label.clone(),
+            salt: if d.salt == Felt::ZERO { None } else { Some(d.salt) },
+            unique: d.unique,
+            calldata: d.calldata.clone(),
+        })
+        .collect();
+    Manifest { schema: 1, classes, contracts }
+}
+
+fn move_list(state: &mut ListState, len: usize, delta: i32) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+    let cur = state.selected().unwrap_or(0) as i32;
+    let next = (cur + delta).clamp(0, len as i32 - 1);
+    state.select(Some(next as usize));
+}
+
+// =============================================================================
+// Drawing
+// =============================================================================
+
+fn draw_app(f: &mut ratatui::Frame<'_>, app: &mut AppState) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(2)])
+        .split(f.area());
+
+    draw_tab_bar(f, app, outer[0]);
+    match app.current_tab {
+        Tab::Classes => draw_classes_tab(f, app, outer[1]),
+        Tab::Contracts => draw_contracts_tab(f, app, outer[1]),
+        Tab::Settings => draw_settings_tab(f, app, outer[1]),
+        Tab::Execute => draw_execute_tab(f, app, outer[1]),
+    }
+    draw_hint_bar(f, app, outer[2]);
+
+    if let Some(modal) = app.modal.as_ref() {
+        draw_modal(f, app, modal);
+    }
+}
+
+fn draw_tab_bar(f: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let titles: Vec<Line<'_>> = Tab::ALL.iter().map(|t| Line::from(t.title())).collect();
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::ALL).title("katana bootstrap"))
+        .select(app.current_tab.idx())
+        .highlight_style(
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(tabs, area);
+}
+
+fn draw_hint_bar(f: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let base = match app.current_tab {
+        Tab::Classes => "[a] add  [d] delete  [j/k] navigate  [Tab] next tab  [q] quit",
+        Tab::Contracts => "[a] add  [e] edit  [d] delete  [j/k] navigate  [Tab] next tab  [q] quit",
+        Tab::Settings if app.settings.editing => "[Esc/Enter] stop editing",
+        Tab::Settings => "[j/k] move  [e/Enter] edit  [Tab] next tab  [q] quit",
+        Tab::Execute => match &app.execution {
+            ExecutionState::Idle => "[x] run  [Tab] next tab  [q] quit",
+            ExecutionState::Running { .. } => "running…",
+            ExecutionState::Done { result: Ok(_), .. } => "[s] save manifest  [q] quit",
+            ExecutionState::Done { .. } => "[q] quit",
+        },
+    };
+    let text =
+        if let Some(flash) = &app.flash { format!("{flash}    {base}") } else { base.to_string() };
+    let style =
+        if app.flash.is_some() { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let p = Paragraph::new(text).style(style);
+    f.render_widget(p, area);
+}
+
+/// Min/max width of the name column on the Classes tab. The actual column width is
+/// the longest name in the current plan, clamped into this range — so the column
+/// expands to fit short lists nicely but caps out before a single pathological alias
+/// can push the source/hash columns off the right edge.
+const CLASS_NAME_WIDTH_MIN: usize = 4;
+const CLASS_NAME_WIDTH_MAX: usize = 32;
+
+fn draw_classes_tab(f: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
+    let name_width = app
+        .classes
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(CLASS_NAME_WIDTH_MIN)
+        .clamp(CLASS_NAME_WIDTH_MIN, CLASS_NAME_WIDTH_MAX);
+    // "embedded" is the longest source label at 8 chars; pin the column to that.
+    const SOURCE_WIDTH: usize = 8;
+
+    let items: Vec<ListItem<'_>> = app
+        .classes
+        .iter()
+        .map(|c| {
+            let source = match &c.source {
+                ClassSource::Embedded(_) => "embedded",
+                ClassSource::File(_) => "file",
+            };
+            let name = truncate_with_ellipsis(&c.name, name_width);
+            ListItem::new(format!(
+                "{:<name_w$}  {:<src_w$}  {:#x}",
+                name,
+                source,
+                c.class_hash,
+                name_w = name_width,
+                src_w = SOURCE_WIDTH,
+            ))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Classes to declare"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.classes_state);
+}
+
+/// Truncate `s` to at most `max` displayed chars, replacing the last char with `…`
+/// when truncation actually happens. Char-counted (not byte-counted) so multi-byte
+/// scripts work the way the user expects, and operates on `chars()` rather than the
+/// raw bytes so we never split inside a UTF-8 sequence.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve one slot for the ellipsis itself.
+    let take = max - 1;
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+fn draw_contracts_tab(f: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
+    let items: Vec<ListItem<'_>> = app
+        .contracts
+        .iter()
+        .map(|c| {
+            ListItem::new(format!(
+                "{:<15} {:<20} salt={:#x}  calldata=[{}]",
+                c.label.as_deref().unwrap_or("-"),
+                c.class_name,
+                c.salt,
+                c.calldata.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(", ")
+            ))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Contracts to deploy"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.contracts_state);
+}
+
+fn draw_settings_tab(f: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let mut lines = Vec::new();
+    for field in SettingsField::ALL {
+        let focused = field == app.settings.focused;
+        let editing = focused && app.settings.editing;
+        let marker = if focused { "> " } else { "  " };
+        let label_style = if focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let mut spans = vec![
+            Span::styled(format!("{marker}{:<14}", field.label()), label_style),
+            Span::raw("  "),
+        ];
+
+        match field {
+            SettingsField::RpcUrl => {
+                if app.settings.rpc_url.is_empty() && !editing {
+                    spans.push(Span::styled("(not set)", Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(render_text_input(&app.settings.rpc_url, editing, false));
+                }
+            }
+            SettingsField::Account => {
+                if app.settings.account.is_empty() && !editing {
+                    spans.push(Span::styled("(not set)", Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(render_text_input(&app.settings.account, editing, false));
+                }
+            }
+            SettingsField::PrivateKey => {
+                if app.settings.private_key.is_empty() && !editing {
+                    spans.push(Span::styled("(not set)", Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(render_text_input(&app.settings.private_key, editing, true));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Settings"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn draw_execute_tab(f: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let header = format!("Plan: {} declares, {} deploys", app.classes.len(), app.contracts.len());
+
+    let (rows, tick): (&[ExecRow], u64) = match &app.execution {
+        ExecutionState::Idle => (&[], 0),
+        ExecutionState::Running { rows, tick, .. } => (rows.as_slice(), *tick),
+        ExecutionState::Done { rows, .. } => (rows.as_slice(), 0),
+    };
+
+    let mut lines: Vec<Line<'_>> = vec![Line::from(header), Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from("(press `x` to start)"));
+    } else {
+        // Compute column widths once across all rows so the trailing detail
+        // (hash/address/error) lines up regardless of how long any individual
+        // primary/secondary cell is.
+        let primary_width =
+            rows.iter().map(|r| r.primary.chars().count()).max().unwrap_or(0).max(1);
+        // Secondary cells are wrapped in parens at render time; the column width
+        // is the longest unwrapped name + 2 for the parens. Plans without any
+        // deploys collapse this column to zero width.
+        let secondary_width = rows
+            .iter()
+            .filter_map(|r| r.secondary.as_ref().map(|s| s.chars().count() + 2))
+            .max()
+            .unwrap_or(0);
+        // `declare` is the longest kind label at 7 chars; pin the column to that.
+        const KIND_WIDTH: usize = 7;
+
+        for row in rows {
+            let (icon, icon_style) = match &row.status {
+                RowStatus::Pending => ("  ".to_string(), Style::default().fg(Color::DarkGray)),
+                RowStatus::Running => {
+                    let frame = SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()];
+                    (format!("{frame} "), Style::default().fg(Color::Yellow))
+                }
+                RowStatus::Done(_) => ("✓ ".to_string(), Style::default().fg(Color::Green)),
+                RowStatus::Failed(_) => ("✗ ".to_string(), Style::default().fg(Color::Red)),
+            };
+            let detail = match &row.status {
+                RowStatus::Done(s) | RowStatus::Failed(s) => s.clone(),
+                _ => String::new(),
+            };
+            let secondary_cell = match &row.secondary {
+                Some(s) => format!("({s})"),
+                None => String::new(),
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(icon, icon_style),
+                Span::raw(format!("{:<KIND_WIDTH$}  ", row.kind.as_str())),
+                Span::raw(format!("{:<primary_width$}  ", row.primary)),
+                Span::raw(format!("{secondary_cell:<secondary_width$}  ")),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    if let ExecutionState::Done { result: Err(err), .. } = &app.execution {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Failed: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let ExecutionState::Done { result: Ok(_), .. } = &app.execution {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Done. Press `s` to save the manifest or `q` to quit.",
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Execute"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn draw_modal(f: &mut ratatui::Frame<'_>, app: &AppState, modal: &Modal) {
+    // Per-modal area sizing. Most modals reuse the standard 60×70 box; the loading
+    // overlay is intentionally small (just a centred status card) so it doesn't
+    // dominate the screen. The background load is brief enough that a big modal
+    // would feel like overkill — and we don't want to obscure the plan tabs more
+    // than we have to.
+    let area = match modal {
+        // Loader modal is small but still wide enough to comfortably fit a typical
+        // file path on one line; long paths and the dup-class notice still wrap via
+        // the Paragraph below.
+        Modal::LoadingClass { .. } => centered_rect(60, 35, f.area()),
+        _ => centered_rect(60, 70, f.area()),
+    };
+    f.render_widget(Clear, area);
+    match modal {
+        Modal::AddClassPicker { picker_state, info } => {
+            // Two-row layout: list on top, single info line at the bottom. The info
+            // row is always present (even when empty) so the picker height doesn't
+            // jitter as the message comes and goes.
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            // Mark embedded classes that are already in the plan with a yellow `*`.
+            // We compare by class hash so the marker stays correct even if the user
+            // picks the same class under a different alias via the file loader. The
+            // marker itself is yellow so it pops against the dimmed body of the row.
+            let mut items: Vec<ListItem<'_>> = embedded::REGISTRY
+                .iter()
+                .map(|c| {
+                    let already_in_plan =
+                        app.classes.iter().any(|existing| existing.class_hash == c.class_hash);
+                    let body = format!("{} — {}", c.name, c.description);
+                    if already_in_plan {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("* ", Style::default().fg(Color::Yellow)),
+                            Span::styled(body, Style::default().fg(Color::DarkGray)),
+                        ]))
+                    } else {
+                        ListItem::new(Line::from(vec![Span::raw("  "), Span::raw(body)]))
+                    }
+                })
+                .collect();
+            // The "load from file…" sentinel never gets a marker — the user's selection
+            // here is the path, not a known class hash.
+            items.push(ListItem::new("  [Load Sierra class from file…]"));
+            let mut state = picker_state.clone();
+            if state.selected().is_none() {
+                state.select(Some(0));
+            }
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title("Add a class"))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, inner[0], &mut state);
+
+            // Inline notice (e.g. "class `dev_account` is already in the plan").
+            if let Some(msg) = info {
+                let p = Paragraph::new(Line::from(Span::styled(
+                    format!("  {msg}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+                f.render_widget(p, inner[1]);
+            }
+        }
+        Modal::AddClassFile { search, error } => {
+            // Three-row layout inside the modal: query + matches list + hint/error.
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // query box
+                    Constraint::Min(0),    // matches list
+                    Constraint::Length(2), // hints / error
+                ])
+                .split(area);
+
+            // Query box.
+            let title = format!("Load class file — fuzzy search under {}", search.root.display());
+            let mut query_spans = vec![Span::raw("  ")];
+            query_spans.extend(render_text_input(&search.query, true, false));
+            let query_para = Paragraph::new(Line::from(query_spans))
+                .block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(query_para, inner[0]);
+
+            // Matches list.
+            let total = search.matches.len();
+            let items: Vec<ListItem<'_>> = search
+                .matches
+                .iter()
+                .map(|(path, _)| {
+                    // Display path relative to the walked root when possible —
+                    // easier to scan than full absolute paths.
+                    let display = path
+                        .strip_prefix(&search.root)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                    ListItem::new(display)
+                })
+                .collect();
+
+            // Three distinct empty states the user might land in: nothing was found
+            // on disk at all, they haven't typed anything yet, or their query just
+            // doesn't match anything. Each one wants a different hint.
+            let list_title = if search.candidates.is_empty() {
+                "(no .json files under cwd)".to_string()
+            } else if search.query.is_empty() {
+                format!("(start typing to search {} files)", search.candidates.len())
+            } else if total == 0 {
+                format!("(no matches in {} files)", search.candidates.len())
+            } else {
+                format!("{}/{} matches", total, search.candidates.len())
+            };
+
+            let mut list_state = ListState::default();
+            if total > 0 {
+                list_state.select(Some(search.selected));
+            }
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(list_title))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, inner[1], &mut list_state);
+
+            // Hints / error.
+            let hint_text = if let Some(e) = error {
+                Span::styled(format!("error: {e}"), Style::default().fg(Color::Red))
+            } else {
+                Span::styled(
+                    "[↑/↓] move  [Enter] load  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let hint = Paragraph::new(Line::from(hint_text));
+            f.render_widget(hint, inner[2]);
+        }
+        Modal::LoadingClass { pending, notice, return_to_search } => {
+            draw_loading_class_modal(f, area, pending, &return_to_search.root, notice.as_deref());
+        }
+        Modal::ContractForm { editing_index, form } => {
+            let opts = class_options(app);
+            let class_display = if opts.is_empty() {
+                "(no classes)".to_string()
+            } else {
+                let c = &opts[form.class_idx];
+                format!("◀ {} ▶", c.name)
+            };
+            let unique = if form.unique { "[x]" } else { "[ ]" };
+            let title = if editing_index.is_some() { "Edit contract" } else { "Add contract" };
+
+            let mut lines = Vec::new();
+            for field in ContractField::ALL {
+                let focused = field == form.focused;
+                let marker = if focused { "> " } else { "  " };
+                let label_style = if focused {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![
+                    Span::styled(format!("{marker}{:<10}", field.label()), label_style),
+                    Span::raw("  "),
+                ];
+                match field {
+                    ContractField::Class => {
+                        spans.push(Span::styled(class_display.clone(), label_style))
+                    }
+                    ContractField::Label => {
+                        spans.extend(render_text_input(&form.label, focused, false))
+                    }
+                    ContractField::Salt => {
+                        spans.extend(render_text_input(&form.salt, focused, false))
+                    }
+                    ContractField::Unique => {
+                        spans.push(Span::styled(unique.to_string(), label_style))
+                    }
+                    ContractField::Calldata => {
+                        spans.extend(render_text_input(&form.calldata, focused, false))
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "[Tab] next field  [←/→] cycle class  [Space] toggle unique  [^A/^E/^W/^U/^K] \
+                 edit  [Enter] save  [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(e) = &form.error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("error: {e}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            let p =
+                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(p, area);
+        }
+        Modal::SaveManifest { path, error } => {
+            let mut lines = vec![Line::from("Save manifest to:")];
+            let mut input_spans = vec![Span::raw("  ")];
+            input_spans.extend(render_text_input(path, true, false));
+            lines.push(Line::from(input_spans));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "[Enter] save  [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(e) = error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("error: {e}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            let p = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Save manifest"));
+            f.render_widget(p, area);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ----- TextInput basics ----------------------------------------------------
+
+    #[test]
+    fn text_input_insert_and_backspace() {
+        let mut t = TextInput::new();
+        for c in "hello".chars() {
+            t.insert_char(c);
+        }
+        assert_eq!(t.as_str(), "hello");
+        assert_eq!(t.cursor, 5);
+        t.backspace();
+        t.backspace();
+        assert_eq!(t.as_str(), "hel");
+        assert_eq!(t.cursor, 3);
+    }
+
+    #[test]
+    fn text_input_cursor_motion_and_mid_insert() {
+        let mut t = TextInput::from_str("worl");
+        t.move_home();
+        assert_eq!(t.cursor, 0);
+        t.move_right();
+        t.move_right();
+        // Insert in the middle: "wo" + "X" + "rl"
+        t.insert_char('X');
+        assert_eq!(t.as_str(), "woXrl");
+        assert_eq!(t.cursor, 3);
+    }
+
+    #[test]
+    fn text_input_handles_multibyte_chars() {
+        let mut t = TextInput::new();
+        t.insert_char('日');
+        t.insert_char('本');
+        assert_eq!(t.cursor, t.len()); // both 3-byte chars
+        t.move_left();
+        // Cursor should now sit between the two chars (3 bytes in).
+        assert_eq!(t.cursor, 3);
+        t.backspace();
+        assert_eq!(t.as_str(), "本");
+    }
+
+    #[test]
+    fn text_input_delete_word_backward_eats_space_then_word() {
+        let mut t = TextInput::from_str("hello world");
+        t.delete_word_backward();
+        assert_eq!(t.as_str(), "hello ");
+        // A second invocation eats the trailing space and then "hello".
+        t.delete_word_backward();
+        assert_eq!(t.as_str(), "");
+    }
+
+    #[test]
+    fn text_input_kill_to_start_and_end() {
+        let mut t = TextInput::from_str("hello world");
+        // Cursor at index 6 → just before "world".
+        t.move_home();
+        for _ in 0..6 {
+            t.move_right();
+        }
+        let saved_cursor = t.cursor;
+        let mut a = t.clone();
+        a.kill_to_end();
+        assert_eq!(a.as_str(), "hello ");
+        assert_eq!(a.cursor, saved_cursor);
+
+        let mut b = t.clone();
+        b.kill_to_start();
+        assert_eq!(b.as_str(), "world");
+        assert_eq!(b.cursor, 0);
+    }
+
+    // ----- handle_text_edit (the readline shortcut handler) -------------------
+
+    fn key(c: char) -> (KeyCode, KeyModifiers) {
+        (KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> (KeyCode, KeyModifiers) {
+        (KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn apply(t: &mut TextInput, evs: &[(KeyCode, KeyModifiers)]) {
+        for (code, mods) in evs {
+            handle_text_edit(t, *code, *mods);
+        }
+    }
+
+    #[test]
+    fn ctrl_a_jumps_to_start_then_typing_inserts_there() {
+        let mut t = TextInput::from_str("world");
+        apply(&mut t, &[ctrl('a'), key('h'), key('i'), key(' ')]);
+        assert_eq!(t.as_str(), "hi world");
+    }
+
+    #[test]
+    fn ctrl_e_jumps_to_end() {
+        let mut t = TextInput::from_str("abc");
+        t.move_home();
+        apply(&mut t, &[ctrl('e'), key('!')]);
+        assert_eq!(t.as_str(), "abc!");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_before_cursor() {
+        let mut t = TextInput::from_str("the quick brown fox");
+        apply(&mut t, &[ctrl('w')]);
+        assert_eq!(t.as_str(), "the quick brown ");
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_start_ctrl_k_kills_to_end() {
+        let mut t = TextInput::from_str("hello world");
+        // Position cursor at index 6 (before "world")
+        t.move_home();
+        for _ in 0..6 {
+            apply(&mut t, &[(KeyCode::Right, KeyModifiers::NONE)]);
+        }
+        let mut a = t.clone();
+        apply(&mut a, &[ctrl('k')]);
+        assert_eq!(a.as_str(), "hello ");
+
+        let mut b = t.clone();
+        apply(&mut b, &[ctrl('u')]);
+        assert_eq!(b.as_str(), "world");
+    }
+
+    #[test]
+    fn arrow_keys_and_backspace() {
+        let mut t = TextInput::from_str("abcde");
+        apply(
+            &mut t,
+            &[
+                (KeyCode::Left, KeyModifiers::NONE),
+                (KeyCode::Left, KeyModifiers::NONE),
+                (KeyCode::Backspace, KeyModifiers::NONE),
+            ],
+        );
+        assert_eq!(t.as_str(), "abde");
+        assert_eq!(t.cursor, 2);
+    }
+
+    #[test]
+    fn handle_text_edit_returns_false_for_unknown_keys() {
+        let mut t = TextInput::from_str("x");
+        let consumed = handle_text_edit(&mut t, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!consumed);
+        let consumed = handle_text_edit(&mut t, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!consumed);
+        // Buffer untouched.
+        assert_eq!(t.as_str(), "x");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_basics() {
+        // Below the cap → unchanged.
+        assert_eq!(truncate_with_ellipsis("foo", 10), "foo");
+        // At the cap → unchanged.
+        assert_eq!(truncate_with_ellipsis("foobarbaz", 9), "foobarbaz");
+        // Above the cap → truncated to exactly `max` chars, with the last as `…`.
+        let truncated = truncate_with_ellipsis("foobarbazquux", 6);
+        assert_eq!(truncated, "fooba…");
+        assert_eq!(truncated.chars().count(), 6);
+        // Multi-byte: don't split inside a UTF-8 sequence.
+        let truncated = truncate_with_ellipsis("日本語テスト", 4);
+        assert_eq!(truncated.chars().count(), 4);
+        assert!(truncated.ends_with('…'));
+        // Edge: max == 0 yields empty.
+        assert_eq!(truncate_with_ellipsis("anything", 0), "");
+    }
+
+    #[test]
+    fn fuzzy_score_subsequence_match() {
+        // Subsequence (non-contiguous) match.
+        assert!(fuzzy_score("foo", "build/foo.json").is_some());
+        // Same chars but out of order → no match.
+        assert!(fuzzy_score("oof", "foo.json").is_none());
+        // Empty query always scores zero (everything matches).
+        assert_eq!(fuzzy_score("", "anything.json"), Some(0));
+        // Case-insensitive.
+        assert!(fuzzy_score("FOO", "build/foo.json").is_some());
+    }
+
+    #[test]
+    fn fuzzy_score_prefers_shorter_paths_and_adjacency() {
+        // Shorter path with the same query wins (length penalty).
+        let short = fuzzy_score("foo", "foo.json").unwrap();
+        let long = fuzzy_score("foo", "a/b/c/d/e/foo.json").unwrap();
+        assert!(short > long, "short {short} should outrank long {long}");
+
+        // Adjacent matches outrank scattered ones for the same candidate length.
+        let adjacent = fuzzy_score("abc", "xabcx").unwrap();
+        let scattered = fuzzy_score("abc", "axbxc").unwrap();
+        assert!(adjacent > scattered, "adjacent {adjacent} should outrank scattered {scattered}");
+    }
+
+    fn make_search(candidates: Vec<&str>) -> FileSearch {
+        FileSearch {
+            query: TextInput::new(),
+            candidates: candidates.into_iter().map(PathBuf::from).collect(),
+            matches: Vec::new(),
+            selected: 0,
+            root: PathBuf::from("."),
+            pending_recompute: None,
+        }
+    }
+
+    #[test]
+    fn file_search_empty_query_yields_no_matches() {
+        // Critical UX rule: don't dump cwd into the user's face before they've
+        // expressed any intent. The matches list stays empty until the first char.
+        let mut s = make_search(vec!["foo.json", "bar.json", "baz.json"]);
+        s.recompute();
+        assert!(s.matches.is_empty(), "empty query should produce zero matches");
+    }
+
+    #[test]
+    fn file_search_recompute_filters_and_sorts() {
+        let mut s =
+            make_search(vec!["a/b/c/d/e/foo.json", "foo.json", "bar.json", "baz/foo_2.json"]);
+
+        // After typing a query, only matches survive and they're sorted by score.
+        for c in "foo".chars() {
+            s.query.insert_char(c);
+        }
+        s.recompute();
+        let paths: Vec<&PathBuf> = s.matches.iter().map(|(p, _)| p).collect();
+        assert!(paths.contains(&&PathBuf::from("foo.json")));
+        assert!(paths.contains(&&PathBuf::from("a/b/c/d/e/foo.json")));
+        assert!(!paths.contains(&&PathBuf::from("bar.json")), "bar shouldn't match `foo`");
+        // The shortest path (`foo.json`) should be first since it has the lowest length penalty.
+        assert_eq!(s.matches.first().unwrap().0, PathBuf::from("foo.json"));
+    }
+
+    #[test]
+    fn file_search_debounce_defers_recompute_until_deadline() {
+        let mut s = make_search(vec!["foo.json", "bar.json"]);
+
+        // Type a character. Mark dirty (what the modal handler does on every keystroke
+        // it forwards to the editor). Matches must NOT update yet — that's the whole
+        // point of the debounce.
+        s.query.insert_char('f');
+        s.mark_dirty();
+        assert!(s.matches.is_empty(), "results before deadline should still be empty");
+
+        // A tick from "now" (well before the deadline) is a no-op.
+        let started = Instant::now();
+        assert!(!s.tick(started));
+        assert!(s.matches.is_empty());
+
+        // Once we cross the deadline, the next tick runs the recompute and clears the
+        // pending flag so we don't keep redoing the work on every subsequent tick.
+        let after = started + FILE_SEARCH_DEBOUNCE + Duration::from_millis(1);
+        assert!(s.tick(after), "tick at/after the deadline should run the recompute");
+        assert_eq!(s.matches.len(), 1);
+        assert_eq!(s.matches[0].0, PathBuf::from("foo.json"));
+        assert!(s.pending_recompute.is_none(), "pending flag must clear after the run");
+
+        // A second tick with no further mutations is a no-op.
+        assert!(!s.tick(after + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn file_search_typing_more_resets_the_debounce() {
+        // Repeated keystrokes should keep pushing the deadline out, so the recompute
+        // only runs once after the user actually pauses.
+        let mut s = make_search(vec!["foo.json"]);
+        s.query.insert_char('f');
+        s.mark_dirty();
+        let first_deadline = s.pending_recompute.unwrap();
+
+        // Sleep zero (just yield) and type again — the new deadline must be at least
+        // as far in the future as the first one.
+        s.query.insert_char('o');
+        s.mark_dirty();
+        let second_deadline = s.pending_recompute.unwrap();
+        assert!(
+            second_deadline >= first_deadline,
+            "subsequent mark_dirty must not bring the deadline forward"
+        );
+    }
+}
+
+/// Render the dedicated "loading class" overlay. Lives in its own function rather
+/// than inline in `draw_modal` because the layout (centred spinner + filename + parent
+/// dir + footer) is significantly different from any other modal — there's no shared
+/// query box or list state to factor with.
+///
+/// `cwd` is the directory the user opened the file picker from (i.e.
+/// `FileSearch::root`); it's used to render the parent path *relative* to where the
+/// user actually is, since long absolute paths just clutter the modal.
+///
+/// When `notice` is `Some`, the spinner row is replaced by the notice text and the
+/// footer hint flips from `[Esc] cancel` to `[Esc] dismiss`. This is how the
+/// "class is already selected" path surfaces to the user.
+fn draw_loading_class_modal(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    pending: &PendingLoad,
+    cwd: &std::path::Path,
+    notice: Option<&str>,
+) {
+    // Display name = file name only (the parent dir gets its own dimmer line below).
+    // Falls back to the full path if file_name() fails for some odd reason.
+    let file_name = pending
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pending.path.to_string_lossy().into_owned());
+    // Render the parent dir relative to cwd when possible. For paths inside cwd this
+    // strips the noisy absolute prefix; for paths outside cwd we fall back to the
+    // full absolute parent. The empty string ("") that `strip_prefix` produces when
+    // the file lives directly in cwd becomes "./" so the line still has *some*
+    // visible content.
+    let parent = pending
+        .path
+        .parent()
+        .map(|abs_parent| match abs_parent.strip_prefix(cwd) {
+            Ok(rel) if rel.as_os_str().is_empty() => "./".to_string(),
+            Ok(rel) => format!("./{}", rel.display()),
+            Err(_) => abs_parent.to_string_lossy().into_owned(),
+        })
+        .unwrap_or_default();
+
+    // Header line: spinner + bold file name (during loading) or static check + name
+    // (once we have something to say about the result).
+    let header = if notice.is_some() {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("✓", Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(file_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        let elapsed = pending.started.elapsed();
+        let frame = SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(frame.to_string(), Style::default().fg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled(file_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ])
+    };
+
+    // Body line: either the notice (yellow) when present, or an elapsed-time row
+    // alongside the parent dir.
+    let mut lines = vec![Line::from(""), header];
+    lines.push(Line::from(vec![
+        Span::raw("     "),
+        Span::styled(parent, Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(msg) = notice {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(msg.to_string(), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[Esc] dismiss", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else {
+        let elapsed = pending.started.elapsed();
+        let elapsed_text =
+            format!("{}.{:01}s elapsed", elapsed.as_secs(), elapsed.subsec_millis() / 100);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(elapsed_text, Style::default().fg(Color::DarkGray)),
+            Span::raw("       "),
+            Span::styled("[Esc] cancel", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " Loading class ",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    ));
+    // Wrap so a long file name, deeply-nested parent path, or wide notice flows
+    // onto multiple lines instead of getting clipped at the modal's right edge.
+    // `trim: false` keeps the leading whitespace we use for indentation.
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Centered rect helper for modal overlays.
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
