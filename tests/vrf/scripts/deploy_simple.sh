@@ -101,6 +101,7 @@ DEPLOY_OUTPUT=$(sncast --accounts-file "$ACCOUNTS_FILE" --account "$ACCOUNT_NAME
     deploy \
     --url "$RPC_URL" \
     --class-hash "$CLASS_HASH" \
+    --salt 0x0 \
     --constructor-calldata "$VRF_PROVIDER" 2>&1) || {
     echo "Deploy failed:" >&2
     echo "$DEPLOY_OUTPUT" >&2
