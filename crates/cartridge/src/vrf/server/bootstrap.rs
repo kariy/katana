@@ -10,6 +10,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use ark_ec::short_weierstrass::Affine;
 use ark_ff::PrimeField;
 use katana_contracts::vrf::{CartridgeVrfAccount, CartridgeVrfConsumer};
 use katana_genesis::constant::DEFAULT_STRK_FEE_TOKEN_ADDRESS;
@@ -18,7 +19,7 @@ use katana_primitives::class::ClassHash;
 use katana_primitives::utils::get_contract_address;
 use katana_primitives::{ContractAddress, Felt};
 use katana_rpc_types::RpcSierraContractClass;
-use stark_vrf::{generate_public_key, ScalarField};
+use stark_vrf::{generate_public_key, ScalarField, StarkCurve};
 use starknet::accounts::{Account, ConnectedAccount, ExecutionEncoding, SingleOwnerAccount};
 use starknet::contract::ContractFactory;
 use starknet::core::types::{BlockId, BlockTag, Call, FlattenedSierraClass, StarknetError};
@@ -77,8 +78,7 @@ pub struct VrfBootstrapResult {
 pub struct VrfAccountCredentials {
     pub private_key: Felt,
     pub account_address: ContractAddress,
-    pub vrf_public_key_x: Felt,
-    pub vrf_public_key_y: Felt,
+    pub public_key: Affine<StarkCurve>,
     pub secret_key: u64,
 }
 
@@ -90,12 +90,10 @@ pub struct VrfAccountCredentials {
 ///
 /// This computes the deterministic VRF account address and VRF key pair
 /// from a fixed VRF private key.
-pub fn get_vrf_account() -> Result<VrfAccountCredentials> {
+pub fn get_default_vrf_account() -> Result<VrfAccountCredentials> {
     let secret_key = VRF_HARDCODED_SECRET_KEY;
     let vrf_account_private_key = Felt::from(secret_key);
     let public_key = generate_public_key(scalar_from_felt(secret_key.into()));
-    let vrf_public_key_x = felt_from_field(public_key.x)?;
-    let vrf_public_key_y = felt_from_field(public_key.y)?;
 
     let account_public_key =
         SigningKey::from_secret_scalar(vrf_account_private_key).verifying_key().scalar();
@@ -114,8 +112,7 @@ pub fn get_vrf_account() -> Result<VrfAccountCredentials> {
     Ok(VrfAccountCredentials {
         private_key: vrf_account_private_key,
         account_address: vrf_account_address,
-        vrf_public_key_x,
-        vrf_public_key_y,
+        public_key,
         secret_key,
     })
 }
@@ -158,7 +155,7 @@ async fn bootstrap_vrf_account(
 ) -> Result<VrfAccountCredentials> {
     let provider = bootstrapper_account.provider();
 
-    let vrf_acc_cred = get_vrf_account()?;
+    let vrf_acc_cred = get_default_vrf_account()?;
     let vrf_account_address = vrf_acc_cred.account_address;
 
     if !is_declared(provider, CartridgeVrfAccount::HASH).await? {
@@ -225,7 +222,10 @@ async fn bootstrap_vrf_account(
     let set_vrf_key_call = Call {
         to: vrf_account_address.into(),
         selector: selector!("set_vrf_public_key"),
-        calldata: vec![vrf_acc_cred.vrf_public_key_x, vrf_acc_cred.vrf_public_key_y],
+        calldata: vec![
+            felt_from_field(vrf_acc_cred.public_key.x)?,
+            felt_from_field(vrf_acc_cred.public_key.y)?,
+        ],
     };
 
     let result = vrf_account
@@ -380,22 +380,22 @@ fn felt_from_field<T: std::fmt::Display>(value: T) -> Result<Felt> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_vrf_account, VRF_HARDCODED_SECRET_KEY};
+    use super::{get_default_vrf_account, VRF_HARDCODED_SECRET_KEY};
 
     #[test]
     fn derive_vrf_accounts_uses_hardcoded_secret_key() {
-        let derived = get_vrf_account().expect("must derive");
+        let derived = get_default_vrf_account().expect("must derive");
         assert_eq!(derived.secret_key, VRF_HARDCODED_SECRET_KEY);
         assert_eq!(derived.private_key, VRF_HARDCODED_SECRET_KEY.into());
     }
 
     #[test]
     fn derive_vrf_accounts_is_deterministic() {
-        let first = get_vrf_account().expect("first derivation");
-        let second = get_vrf_account().expect("second derivation");
+        let first = get_default_vrf_account().expect("first derivation");
+        let second = get_default_vrf_account().expect("second derivation");
 
         assert_eq!(first.account_address, second.account_address);
-        assert_eq!(first.vrf_public_key_x, second.vrf_public_key_x);
-        assert_eq!(first.vrf_public_key_y, second.vrf_public_key_y);
+        assert_eq!(first.public_key.x, second.public_key.x);
+        assert_eq!(first.public_key.y, second.public_key.y);
     }
 }

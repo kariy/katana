@@ -49,14 +49,12 @@ use katana_rpc_types::outside_execution::OutsideExecution;
 use katana_rpc_types::{FunctionCall, SignedOutsideExecution};
 use katana_tasks::TaskSpawner;
 use paymaster_rpc::{
-    ExecuteRawRequest, ExecuteRawTransactionParameters, ExecutionParameters, FeeMode,
-    RawInvokeParameters,
+    DirectInvokeParameters, ExecuteDirectRequest, ExecuteDirectTransactionParameters,
+    ExecutionParameters, FeeMode,
 };
 use starknet_paymaster::core::types::Call as StarknetRsCall;
 use tracing::{debug, info, trace_span, Instrument};
 use url::Url;
-#[cfg(feature = "vrf")]
-use vrf::find_and_get_request_random_call;
 pub use vrf::{VrfService, VrfServiceConfig};
 
 #[derive(Debug, Clone)]
@@ -64,8 +62,6 @@ pub struct CartridgeConfig {
     pub api_url: Url,
     pub paymaster_url: Url,
     pub paymaster_api_key: Option<String>,
-    #[cfg(feature = "vrf")]
-    pub vrf: Option<vrf::VrfServiceConfig>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -76,8 +72,6 @@ pub struct CartridgeApi<PF: ProviderFactory> {
     pool: TxPool,
     api_client: cartridge::CartridgeApiClient,
     paymaster_client: HttpClient,
-    #[cfg(feature = "vrf")]
-    vrf_service: Option<VrfService>,
 }
 
 impl<PF> Clone for CartridgeApi<PF>
@@ -92,8 +86,6 @@ where
             pool: self.pool.clone(),
             api_client: self.api_client.clone(),
             paymaster_client: self.paymaster_client.clone(),
-            #[cfg(feature = "vrf")]
-            vrf_service: self.vrf_service.clone(),
         }
     }
 }
@@ -113,10 +105,7 @@ where
     ) -> anyhow::Result<Self> {
         let api_client = cartridge::CartridgeApiClient::new(config.api_url);
 
-        #[cfg(feature = "vrf")]
-        let vrf_service = config.vrf.map(VrfService::new);
-
-        info!(target: "rpc::cartridge", vrf_enabled = vrf_service.is_some(), "Cartridge API initialized.");
+        info!(target: "rpc::cartridge", "Cartridge API initialized.");
 
         let paymaster_client = {
             let headers = if let Some(api_key) = &config.paymaster_api_key {
@@ -130,63 +119,17 @@ where
             HttpClientBuilder::default().set_headers(headers).build(config.paymaster_url)?
         };
 
-        Ok(Self {
-            task_spawner,
-            backend,
-            block_producer,
-            pool,
-            api_client,
-            paymaster_client,
-            #[cfg(feature = "vrf")]
-            vrf_service,
-        })
+        Ok(Self { task_spawner, backend, block_producer, pool, api_client, paymaster_client })
     }
 
     pub async fn execute_outside(
         &self,
-        contract_address: ContractAddress,
+        address: ContractAddress,
         outside_execution: OutsideExecution,
         signature: Vec<Felt>,
         fee_source: Option<FeeSource>,
     ) -> Result<AddInvokeTransactionResponse, CartridgeApiError> {
-        debug!(target: "rpc::cartridge", %contract_address, ?fee_source, "Adding execute outside transaction.");
-
-        let mut signed =
-            SignedOutsideExecution { address: contract_address, outside_execution, signature };
-
-        #[cfg(feature = "vrf")]
-        if let Some(vrf_service) = &self.vrf_service {
-            // check first if the outside execution calls include a request_random call
-            if let Some((req_rand_call, pos)) =
-                find_and_get_request_random_call(&signed.outside_execution)
-            {
-                debug!(target: "rpc::cartridge", "Found a request_random call.");
-
-                // Ensure there is a follow-up call after the request_random call
-                //
-                // Case: request_random is the only call or the last call
-                if (pos + 1) == signed.outside_execution.calls().len() {
-                    return Err(CartridgeApiError::VrfMissingFollowUpCall);
-                }
-
-                if req_rand_call.contract_address != vrf_service.account_address() {
-                    return Err(CartridgeApiError::VrfInvalidTarget {
-                        requested: req_rand_call.contract_address,
-                        supported: vrf_service.account_address(),
-                    });
-                }
-
-                let chain_id = self.backend.chain_spec.id();
-                let vrf_signed_outside_execution = vrf_service
-                    .outside_execution(&signed, chain_id)
-                    .instrument(trace_span!(target: "rpc::cartridge", "vrf.outside_execution"))
-                    .await?;
-
-                signed = vrf_signed_outside_execution;
-            }
-        }
-
-        let call = Call::from(signed);
+        debug!(target: "rpc::cartridge", %address, ?fee_source, "Adding execute outside transaction.");
 
         let fee_mode = match fee_source {
             Some(FeeSource::Credits) => FeeMode::Default {
@@ -197,9 +140,8 @@ where
             Some(FeeSource::Paymaster) | None => FeeMode::Sponsored { tip: Default::default() },
         };
 
-        let invoke = RawInvokeParameters {
-            gas_token: None,
-            max_gas_token_amount: None,
+        let call = Call::from(SignedOutsideExecution { address, outside_execution, signature });
+        let invoke = DirectInvokeParameters {
             user_address: call.contract_address.into(),
             execute_from_outside_call: StarknetRsCall {
                 calldata: call.calldata,
@@ -208,19 +150,15 @@ where
             },
         };
 
-        let request = ExecuteRawRequest {
-            transaction: ExecuteRawTransactionParameters::RawInvoke { invoke },
-            parameters: ExecutionParameters::V1 { fee_mode, time_bounds: None },
-        };
+        let transaction = ExecuteDirectTransactionParameters::Invoke { invoke };
+        let parameters = ExecutionParameters::V1 { fee_mode, time_bounds: None };
 
-        let response = self
-            .paymaster_client
-            .execute_raw_transaction(request)
+        self.paymaster_client
+            .execute_direct_transaction(ExecuteDirectRequest { transaction, parameters })
             .instrument(trace_span!(target: "rpc::cartridge", "paymaster.execute_raw_transaction"))
             .await
-            .map_err(|e| CartridgeApiError::PaymasterExecutionFailed { reason: e.to_string() })?;
-
-        Ok(AddInvokeTransactionResponse { transaction_hash: response.transaction_hash })
+            .map(|resp| AddInvokeTransactionResponse { transaction_hash: resp.transaction_hash })
+            .map_err(|e| CartridgeApiError::PaymasterExecutionFailed { reason: e.to_string() })
     }
 }
 

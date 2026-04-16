@@ -14,14 +14,12 @@ use katana_primitives::contract::Nonce;
 use katana_primitives::da::DataAvailabilityMode;
 use katana_primitives::execution::Call;
 use katana_primitives::fee::{AllResourceBoundsMapping, ResourceBoundsMapping};
-use katana_primitives::{ContractAddress, Felt};
+use katana_primitives::ContractAddress;
 use katana_provider::{ProviderFactory, ProviderRO};
 use katana_rpc_api::error::cartridge::CartridgeApiError;
 use katana_rpc_api::error::starknet::StarknetApiError;
 use katana_rpc_types::broadcasted::{BroadcastedTx, BroadcastedTxWithChainId};
-use katana_rpc_types::{BroadcastedInvokeTx, FeeEstimate, FeeSource, OutsideExecution};
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use katana_rpc_types::{BroadcastedInvokeTx, FeeEstimate};
 use starknet::core::types::SimulationFlagForEstimateFee;
 use starknet::macros::selector;
 use starknet::signers::local_wallet::SignError;
@@ -29,12 +27,13 @@ use starknet::signers::{LocalWallet, Signer, SigningKey};
 use tower::Layer;
 use tracing::{debug, trace};
 
+use super::utils::{
+    parse_params, AddExecuteOutsideParams, AddExecuteOutsideRequestParams, EstimateFeeParams,
+    EstimateFeeRequestParams, CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE,
+    CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE_TX, STARKNET_ESTIMATE_FEE,
+};
 use crate::cartridge::encode_calls;
 use crate::starknet::{PendingBlockProvider, StarknetApi};
-
-const STARKNET_ESTIMATE_FEE: &str = "starknet_estimateFee";
-const CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE: &str = "cartridge_addExecuteFromOutside";
-const CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE_TX: &str = "cartridge_addExecuteOutsideTransaction";
 
 #[derive(Debug)]
 struct ControllerDeploymentContext<Pool, PP, PF>
@@ -134,15 +133,31 @@ where
     PF: ProviderFactory,
     <PF as ProviderFactory>::Provider: ProviderRO,
 {
-    fn estimate_fee_candidate_addresses(transactions: &[BroadcastedTx]) -> Vec<ContractAddress> {
-        transactions
-            .iter()
-            .filter_map(|tx| match tx {
-                BroadcastedTx::Invoke(tx) => Some(tx.sender_address),
-                BroadcastedTx::Declare(tx) => Some(tx.sender_address),
-                _ => None,
-            })
-            .collect()
+    async fn estimate_fee_candidate_addresses(
+        &self,
+        block_id: BlockIdOrTag,
+        transactions: &[BroadcastedTx],
+    ) -> Result<Vec<ContractAddress>, CartridgeApiError> {
+        let mut undeployed_address = Vec::with_capacity(transactions.len());
+
+        for tx in transactions {
+            let address = match tx {
+                BroadcastedTx::Invoke(tx) => tx.sender_address,
+                BroadcastedTx::Declare(tx) => tx.sender_address,
+                _ => continue,
+            };
+
+            match self.context.starknet.class_hash_at_address(block_id, address).await {
+                Err(StarknetApiError::ContractNotFound) => undeployed_address.push(address),
+
+                Ok(..) => {}
+                Err(e) => {
+                    return Err(CartridgeApiError::ControllerDeployment { error: Box::new(e) })
+                }
+            };
+        }
+
+        Ok(undeployed_address)
     }
 
     fn build_estimate_fee_request<'a>(
@@ -192,7 +207,8 @@ where
         request: Request<'a>,
     ) -> Result<S::MethodResponse, CartridgeApiError> {
         let EstimateFeeParams { block_id, simulation_flags, transactions } = params;
-        let candidate_addresses = Self::estimate_fee_candidate_addresses(&transactions);
+        let candidate_addresses =
+            self.estimate_fee_candidate_addresses(block_id, &transactions).await?;
 
         let deployer_nonce = self
             .context
@@ -208,12 +224,13 @@ where
 
         // No Controller to deploy, simply forward the request.
         if deploy_controller_txs.is_empty() {
-            let response = self.service.call(request).await;
-            return Ok(response);
+            trace!(target: "middleware::cartridge", "No controller to deploy - forwarding request.");
+            return Ok(self.service.call(request).await);
         }
 
         let og_txs_len = transactions.len();
         let deploy_txs_len = deploy_controller_txs.len();
+        trace!(target: "middleware::cartridge", deployment_count = deploy_txs_len, "Prepending controller deployment transactions to estimate fee.");
 
         // Build a new estimateFee request with the deploy controller transactions prepended.
         let new_estimates_txs = [deploy_controller_txs, transactions].concat();
@@ -418,7 +435,7 @@ where
 
             match method {
                 STARKNET_ESTIMATE_FEE => {
-                    trace!(target: "middleware::cartridge", %method, "Intercepting JSON-RPC method.");
+                    trace!(target: "middleware::cartridge::controller", %method, "Intercepting JSON-RPC method.");
                     if let Ok(params) = parse_params::<EstimateFeeRequestParams>(&request)
                         .inspect_err(|error| debug!(target: "middleware::cartridge", %method, %error, "Failed to parse params."))
                     {
@@ -427,7 +444,7 @@ where
                 }
 
                 CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE | CARTRIDGE_ADD_EXECUTE_FROM_OUTSIDE_TX => {
-                    trace!(target: "middleware::cartridge", %method, "Intercepting JSON-RPC method.");
+                    trace!(target: "middleware::cartridge::controller", %method, "Intercepting JSON-RPC method.");
                     if let Ok(params) = parse_params::<AddExecuteOutsideRequestParams>(&request)
 	                    .inspect_err(|error| debug!(target: "middleware::cartridge", %method, %error, "Failed to parse params."))
                     {
@@ -487,81 +504,4 @@ pub enum Error {
 
     #[error("failed to sign deploy transaction: {0}")]
     SigningError(SignError),
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct AddExecuteOutsideParams {
-    address: ContractAddress,
-    outside_execution: OutsideExecution,
-    signature: Vec<Felt>,
-    fee_source: Option<FeeSource>,
-}
-
-#[derive(Deserialize)]
-struct EstimateFeeParams {
-    #[serde(alias = "request")]
-    transactions: Vec<BroadcastedTx>,
-    #[serde(alias = "simulationFlags")]
-    simulation_flags: Vec<SimulationFlagForEstimateFee>,
-    #[serde(alias = "blockId")]
-    block_id: BlockIdOrTag,
-}
-
-#[derive(Deserialize)]
-struct AddExecuteOutsidePositionalParams(
-    ContractAddress,
-    OutsideExecution,
-    Vec<Felt>,
-    #[serde(default)] Option<FeeSource>,
-);
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AddExecuteOutsideRequestParams {
-    Named(AddExecuteOutsideParams),
-    Positional(AddExecuteOutsidePositionalParams),
-}
-
-impl From<AddExecuteOutsideRequestParams> for AddExecuteOutsideParams {
-    fn from(value: AddExecuteOutsideRequestParams) -> Self {
-        match value {
-            AddExecuteOutsideRequestParams::Named(params) => params,
-            AddExecuteOutsideRequestParams::Positional(params) => Self {
-                address: params.0,
-                outside_execution: params.1,
-                signature: params.2,
-                fee_source: params.3,
-            },
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct EstimateFeePositionalParams(
-    Vec<BroadcastedTx>,
-    Vec<SimulationFlagForEstimateFee>,
-    BlockIdOrTag,
-);
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum EstimateFeeRequestParams {
-    Named(EstimateFeeParams),
-    Positional(EstimateFeePositionalParams),
-}
-
-impl From<EstimateFeeRequestParams> for EstimateFeeParams {
-    fn from(value: EstimateFeeRequestParams) -> Self {
-        match value {
-            EstimateFeeRequestParams::Named(params) => params,
-            EstimateFeeRequestParams::Positional(params) => {
-                Self { transactions: params.0, simulation_flags: params.1, block_id: params.2 }
-            }
-        }
-    }
-}
-
-fn parse_params<T: DeserializeOwned>(request: &Request<'_>) -> Result<T, ErrorObjectOwned> {
-    request.params().parse()
 }

@@ -23,9 +23,9 @@ use katana_utils::node::test_config_with_controllers;
 use katana_utils::TestNode;
 use parking_lot::Mutex;
 use paymaster_rpc::{
-    BuildTransactionRequest, BuildTransactionResponse, ExecuteRawRequest, ExecuteRawResponse,
-    ExecuteRawTransactionParameters, ExecuteRequest, ExecuteResponse, RawInvokeParameters,
-    TokenPrice,
+    BuildTransactionRequest, BuildTransactionResponse, DirectInvokeParameters,
+    ExecuteDirectRequest, ExecuteDirectResponse, ExecuteDirectTransactionParameters,
+    ExecuteRequest, ExecuteResponse, TokenPrice,
 };
 use serde::Deserialize;
 use starknet::accounts::{Account, AccountError, ExecutionEncoding, SingleOwnerAccount};
@@ -223,7 +223,10 @@ async fn estimate_fee_account_deployed_works_normally() {
 
     // Cartridge API should still be queried on estimate fee
     let api_requests = mock_api_state.received_requests.lock();
-    assert!(api_requests.contains(&sender), "Cartridge API should be queried once");
+    assert!(
+        !api_requests.contains(&sender),
+        "Already deployed account shouln't call Cartridge API"
+    );
 }
 
 #[tokio::test]
@@ -405,7 +408,7 @@ async fn start_mock_paymaster() -> (Url, MockPaymaster) {
 struct MockPaymaster {
     // track execute_raw_transaction requests
     execute_raw_transaction_requests:
-        Arc<Mutex<HashMap<ContractAddress, Vec<RawInvokeParameters>>>>,
+        Arc<Mutex<HashMap<ContractAddress, Vec<DirectInvokeParameters>>>>,
 }
 
 #[async_trait]
@@ -431,12 +434,12 @@ impl PaymasterApiServer for MockPaymaster {
         unimplemented!()
     }
 
-    async fn execute_raw_transaction(
+    async fn execute_direct_transaction(
         &self,
-        req: ExecuteRawRequest,
-    ) -> RpcResult<ExecuteRawResponse> {
+        req: ExecuteDirectRequest,
+    ) -> RpcResult<ExecuteDirectResponse> {
         match req.transaction {
-            ExecuteRawTransactionParameters::RawInvoke { invoke } => {
+            ExecuteDirectTransactionParameters::Invoke { invoke } => {
                 let sender_address = invoke.user_address;
                 self.execute_raw_transaction_requests
                     .lock()
@@ -446,7 +449,7 @@ impl PaymasterApiServer for MockPaymaster {
             }
         }
 
-        Ok(ExecuteRawResponse { transaction_hash: felt!("0xcafe"), tracking_id: Felt::ZERO })
+        Ok(ExecuteDirectResponse { transaction_hash: felt!("0xcafe"), tracking_id: Felt::ZERO })
     }
 
     async fn get_supported_tokens(&self) -> RpcResult<Vec<TokenPrice>> {
