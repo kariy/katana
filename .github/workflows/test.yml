@@ -314,12 +314,12 @@ jobs:
             - name: Run tests (ubuntu)
               if: matrix.os == 'ubuntu' && github.event_name != 'pull_request'
               run: |
-                  cargo nextest run --all-features --workspace --exclude snos-integration-test --exclude db-compat-test --exclude vrf-e2e-test --build-jobs 20
+                  cargo nextest run --all-features --workspace --exclude snos-integration-test --exclude db-compat-test --exclude vrf-e2e-test --exclude saya-tee-e2e-test --build-jobs 20
 
             - name: Run tests w/ code coverage (ubuntu)
               if: matrix.os == 'ubuntu' && github.event_name == 'pull_request'
               run: |
-                  cargo llvm-cov nextest --no-report --all-features --workspace --exclude snos-integration-test --exclude db-compat-test --exclude vrf-e2e-test --build-jobs 20
+                  cargo llvm-cov nextest --no-report --all-features --workspace --exclude snos-integration-test --exclude db-compat-test --exclude vrf-e2e-test --exclude saya-tee-e2e-test --build-jobs 20
                   cargo llvm-cov report --lcov --output-path lcov.info
 
             - name: Upload code coverage
@@ -491,6 +491,53 @@ jobs:
 
             - name: Run cartridge e2e test
               run: cargo run -p vrf-e2e-test
+
+    saya-tee-e2e:
+        needs: [fmt, clippy, generate-test-artifacts]
+        runs-on: ubuntu-latest-32-cores
+        timeout-minutes: 45
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+        container:
+            image: ghcr.io/dojoengine/katana-dev:latest
+        env:
+            MLIR_SYS_190_PREFIX: /usr/lib/llvm-19/
+            LLVM_SYS_191_PREFIX: /usr/lib/llvm-19/
+            TABLEGEN_190_PREFIX: /usr/lib/llvm-19/
+        steps:
+            - uses: actions/checkout@v3
+              with:
+                  submodules: recursive
+            - run: git config --global --add safe.directory "*"
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: ci-${{ github.job }}
+                  shared-key: katana-ci-cache
+
+            - name: Download test artifacts
+              uses: actions/download-artifact@v5
+              with:
+                  name: fixtures
+
+            - name: Clone Saya repository
+              run: |
+                  git clone https://github.com/dojoengine/saya /tmp/saya
+                  git -C /tmp/saya checkout 5a3b8c9
+
+            - uses: software-mansion/setup-scarb@v1
+              with:
+                  scarb-version: "2.13.1"
+
+            - name: Install saya-ops
+              run: cargo install --locked --path /tmp/saya/bin/ops --bin saya-ops
+
+            - name: Install saya-tee
+              run: cargo install --locked --path /tmp/saya/bin/persistent-tee --bin saya-tee
+
+            - name: Run saya-tee e2e test
+              env:
+                  RUST_LOG: info,saya_tee_e2e_test=debug,persistent_tee=info
+              run: cargo run -p saya-tee-e2e-test
 
     db-compatibility-check:
         needs: [fmt, clippy, build-katana-binary]
