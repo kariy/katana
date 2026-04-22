@@ -122,25 +122,13 @@ jobs:
                       tests/fixtures/db/1_6_0
                       tests/fixtures/db/snos
 
-    build-katana-binary:
+    build-katana-binary-ubuntu:
         needs: [detect-changes, fmt, clippy, generate-test-artifacts]
-        runs-on: ${{ matrix.runner }}
-        timeout-minutes: ${{ matrix.os == 'macos' && 120 || 30 }}
-        strategy:
-            matrix:
-                include:
-                    - os: ubuntu
-                      runner: ubuntu-latest-32-cores
-                      container: ghcr.io/dojoengine/katana-dev:latest
-                    - os: macos
-                      runner: macos-latest
-                      container: null
-        # Skip the macOS build on explorer-only changes — its only consumer is
-        # the macOS entry of the `test` matrix, which is also skipped.
-        if: |
-            (matrix.os != 'macos' || needs.detect-changes.outputs.broader-rust == 'true') &&
-            (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
-        container: ${{ matrix.container }}
+        runs-on: ubuntu-latest-32-cores
+        timeout-minutes: 30
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+        container:
+            image: ghcr.io/dojoengine/katana-dev:latest
         env:
             MLIR_SYS_190_PREFIX: /usr/lib/llvm-19/
             LLVM_SYS_191_PREFIX: /usr/lib/llvm-19/
@@ -152,8 +140,50 @@ jobs:
             # Workaround for https://github.com/actions/runner-images/issues/6775
             - run: git config --global --add safe.directory "*"
 
-            - name: Free disk space (macOS)
-              if: matrix.os == 'macos'
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: ci-${{ github.job }}-ubuntu
+                  shared-key: katana-ci-cache-ubuntu
+
+            - name: Download contract artifacts
+              uses: actions/download-artifact@v5
+              with:
+                  name: fixtures
+
+            - name: Build binary with all features
+              run: cargo build --bin katana --all-features
+
+            - name: Upload binary
+              uses: actions/upload-artifact@v4
+              with:
+                  name: binary-ubuntu
+                  overwrite: true
+                  retention-days: 1
+                  if-no-files-found: error
+                  path: ./target/debug/katana
+
+    # Skipped on explorer-only changes — the only consumer of this job's
+    # artifacts is the macOS entry of `test`, which is also skipped when
+    # `broader-rust` is false.
+    build-katana-binary-macos:
+        needs: [detect-changes, fmt, clippy, generate-test-artifacts]
+        runs-on: macos-latest
+        timeout-minutes: 120
+        if: |
+            needs.detect-changes.outputs.broader-rust == 'true' &&
+            (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
+        env:
+            MLIR_SYS_190_PREFIX: /usr/lib/llvm-19/
+            LLVM_SYS_191_PREFIX: /usr/lib/llvm-19/
+            TABLEGEN_190_PREFIX: /usr/lib/llvm-19/
+        steps:
+            - uses: actions/checkout@v3
+              with:
+                  submodules: recursive
+            # Workaround for https://github.com/actions/runner-images/issues/6775
+            - run: git config --global --add safe.directory "*"
+
+            - name: Free disk space
               run: |
                   sudo rm -rf /opt/hostedtoolcache
                   sudo rm -rf /Users/runner/Library/Android
@@ -163,26 +193,23 @@ jobs:
 
             - uses: Swatinem/rust-cache@v2
               with:
-                  key: ci-${{ github.job }}-${{ matrix.os }}
-                  shared-key: katana-ci-cache-${{ matrix.os }}
+                  key: ci-${{ github.job }}-macos
+                  shared-key: katana-ci-cache-macos
 
-            - name: Install LLVM 19 (macOS)
-              if: matrix.os == 'macos'
+            - name: Install LLVM 19
               run: |
                   brew install llvm@19
                   echo "MLIR_SYS_190_PREFIX=$(brew --prefix llvm@19)" >> $GITHUB_ENV
                   echo "LLVM_SYS_191_PREFIX=$(brew --prefix llvm@19)" >> $GITHUB_ENV
                   echo "TABLEGEN_190_PREFIX=$(brew --prefix llvm@19)" >> $GITHUB_ENV
 
-            - name: Install zstd and protobuf (macOS)
-              if: matrix.os == 'macos'
+            - name: Install zstd and protobuf
               run: |
                   brew install zstd pkg-config protobuf
                   echo "PKG_CONFIG_PATH=$(brew --prefix zstd)/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
                   echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$LIBRARY_PATH" >> $GITHUB_ENV
 
-            - name: Build Explorer UI (macOS)
-              if: matrix.os == 'macos'
+            - name: Build Explorer UI
               run: |
                   curl -fsSL https://bun.sh/install | bash
                   export BUN_INSTALL="$HOME/.bun"
@@ -194,8 +221,7 @@ jobs:
               with:
                   name: fixtures
 
-            - name: Install cargo-nextest (macOS)
-              if: matrix.os == 'macos'
+            - name: Install cargo-nextest
               uses: taiki-e/install-action@v2
               with:
                   tool: cargo-nextest
@@ -207,22 +233,20 @@ jobs:
             # without recompilation (macOS runners are too slow to compile + test
             # within a single job timeout). Runs after the binary build so deps
             # are already compiled.
-            - name: Build and archive test binaries (macOS)
-              if: matrix.os == 'macos'
+            - name: Build and archive test binaries
               run: |
                   cargo nextest archive --all-features --workspace --exclude snos-integration-test --exclude db-compat-test --archive-file nextest-archive.tar.zst
 
             - name: Upload binary
               uses: actions/upload-artifact@v4
               with:
-                  name: binary-${{ matrix.os }}
+                  name: binary-macos
                   overwrite: true
                   retention-days: 1
                   if-no-files-found: error
                   path: ./target/debug/katana
 
-            - name: Upload nextest archive (macOS)
-              if: matrix.os == 'macos'
+            - name: Upload nextest archive
               uses: actions/upload-artifact@v4
               with:
                   name: nextest-archive-macos
@@ -262,7 +286,7 @@ jobs:
               run: ./scripts/clippy.sh
 
     test:
-        needs: [detect-changes, fmt, clippy, generate-test-artifacts, build-katana-binary]
+        needs: [detect-changes, fmt, clippy, generate-test-artifacts, build-katana-binary-ubuntu, build-katana-binary-macos]
         runs-on: ${{ matrix.runner }}
         timeout-minutes: ${{ matrix.os == 'macos' && 60 || 30 }}
         strategy:
@@ -444,7 +468,7 @@ jobs:
     #         cargo run -p snos-integration-test
 
     explorer-reverse-proxy:
-        needs: [fmt, clippy, build-katana-binary]
+        needs: [fmt, clippy, build-katana-binary-ubuntu]
         runs-on: ubuntu-latest
         if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
         container:
@@ -476,7 +500,7 @@ jobs:
                   KATANA_BIN=./katana ./scripts/reverse-proxy-test.sh
 
     dojo-integration-test:
-        needs: [detect-changes, fmt, clippy, build-katana-binary]
+        needs: [detect-changes, fmt, clippy, build-katana-binary-ubuntu]
         runs-on: ubuntu-latest-32-cores
         if: |
             needs.detect-changes.outputs.broader-rust == 'true' &&
@@ -631,7 +655,7 @@ jobs:
               run: cargo run -p saya-tee-e2e-test
 
     db-compatibility-check:
-        needs: [detect-changes, fmt, clippy, build-katana-binary]
+        needs: [detect-changes, fmt, clippy, build-katana-binary-ubuntu]
         runs-on: ubuntu-latest-4-cores
         if: |
             needs.detect-changes.outputs.broader-rust == 'true' &&
