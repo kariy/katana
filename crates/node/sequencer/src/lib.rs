@@ -235,6 +235,8 @@ where
 
         // --- build rpc server
 
+        info!(target: "rpc", apis = %config.rpc.apis, "Enabled JSON-RPC APIs.");
+
         let mut rpc_modules = RpcModule::new(());
 
         // Allow `POST` when accessing the resource
