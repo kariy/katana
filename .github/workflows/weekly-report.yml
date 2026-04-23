@@ -71,9 +71,6 @@ jobs:
               with:
                   key: weekly-binary-size-release
 
-            - name: Build contract artifacts
-              run: make contracts
-
             - name: Get latest release tag
               run: |
                   LATEST_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -84,14 +81,17 @@ jobs:
                   fi
 
                   echo "Latest release tag: $LATEST_TAG"
-                  echo "LATEST_RELEASE=$LATEST_TAG" >> $GITHUB_ENV
+                  echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
 
             - name: Get binary size (latest release)
               id: binary-size
               run: |
                   echo "Latest release tag: $LATEST_TAG"
 
-                  git checkout $LATEST_TAG
+                  git checkout "$LATEST_TAG"
+                  git submodule update --init --recursive
+
+                  make contracts
                   cargo build --bin katana --profile performance
 
                   BINARY_SIZE=$(stat --format %s ./target/performance/katana)
