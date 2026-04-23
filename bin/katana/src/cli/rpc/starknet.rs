@@ -16,86 +16,86 @@ use super::client::Client;
 #[derive(Debug, Subcommand)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum StarknetCommands {
-    /// Get Starknet JSON-RPC specification version
+    /// Get Starknet JSON-RPC specification version [starknet_specVersion]
     #[command(name = "spec")]
     SpecVersion,
 
-    /// Get block with full transactions
+    /// Get block with full transactions [starknet_getBlockWithTxs]
     #[command(name = "block")]
     GetBlockWithTxs(GetBlockArgs),
 
-    /// Get state update for a block
+    /// Get state update for a block [starknet_getStateUpdate]
     #[command(name = "state-update")]
     GetStateUpdate(BlockIdArgs),
 
-    /// Get storage value at address and key
+    /// Get storage value at address and key [starknet_getStorageAt]
     #[command(name = "storage")]
     GetStorageAt(GetStorageAtArgs),
 
-    /// Get transaction by hash
+    /// Get transaction by hash [starknet_getTransactionByHash]
     #[command(name = "tx")]
     GetTransactionByHash(GetTransactionArgs),
 
-    /// Get transaction by block ID and index
+    /// Get transaction by block ID and index [starknet_getTransactionByBlockIdAndIndex]
     #[command(name = "tx-by-block")]
     GetTransactionByBlockIdAndIndex(GetTransactionByBlockIdAndIndexArgs),
 
-    /// Get transaction receipt
+    /// Get transaction receipt [starknet_getTransactionReceipt]
     #[command(name = "receipt")]
     GetTransactionReceipt(TxHashArgs),
 
-    /// Get contract class definition
+    /// Get contract class definition [starknet_getClass]
     #[command(name = "class")]
     GetClass(GetClassArgs),
 
-    /// Get contract class hash at address
+    /// Get contract class hash at address [starknet_getClassHashAt]
     #[command(name = "class-at")]
     GetClassHashAt(GetClassHashAtArgs),
 
-    /// Get contract class at address
+    /// Get contract class at address [starknet_getClassAt]
     #[command(name = "code")]
     GetClassAt(GetClassAtArgs),
 
-    /// Get number of transactions in block
+    /// Get number of transactions in block [starknet_getBlockTransactionCount]
     #[command(name = "tx-count")]
     GetBlockTransactionCount(BlockIdArgs),
 
-    /// Call contract function
+    /// Call contract function [starknet_call]
     #[command(name = "call")]
     Call(CallArgs),
 
-    /// Get latest block number
+    /// Get latest block number [starknet_blockNumber]
     #[command(name = "block-number")]
     BlockNumber,
 
-    /// Get latest block hash and number
+    /// Get latest block hash and number [starknet_blockHashAndNumber]
     BlockHashAndNumber,
 
-    /// Get chain ID
+    /// Get chain ID [starknet_chainId]
     #[command(name = "id")]
     ChainId,
 
-    /// Get sync status
+    /// Get sync status [starknet_syncing]
     #[command(name = "sync")]
     Syncing,
 
-    /// Get nonce for address
+    /// Get nonce for address [starknet_getNonce]
     #[command(name = "nonce")]
     GetNonce(GetNonceArgs),
 
-    /// Get events matching filter criteria
+    /// Get events matching filter criteria [starknet_getEvents]
     #[command(name = "events")]
     GetEvents(GetEventsArgs),
 
-    /// Get transaction execution trace
+    /// Get transaction execution trace [starknet_traceTransaction]
     #[command(name = "trace")]
     TraceTransaction(TxHashArgs),
 
-    /// Get execution traces for all transactions in a block
+    /// Get execution traces for all transactions in a block [starknet_traceBlockTransactions]
     #[command(name = "block-traces")]
     TraceBlockTransactions(TraceBlockTransactionsArg),
 
-    /// Get storage proofs for classes, contracts, and storage keys
+    /// Get storage proofs for classes, contracts, and storage keys [starknet_getStorageProof]
     #[command(name = "proof")]
     GetStorageProof(GetStorageProofArgs),
 }
@@ -115,11 +115,11 @@ pub struct GetBlockArgs {
     #[arg(default_value = "latest")]
     block: BlockIdArg,
 
-    /// Return block with receipts
+    /// Return block with receipts [starknet_getBlockWithReceipts]
     #[arg(long)]
     receipts: bool,
 
-    /// Return only transaction hashes instead of full transactions
+    /// Return only transaction hashes instead of full transactions [starknet_getBlockWithTxHashes]
     #[arg(long, conflicts_with = "receipts")]
     tx_hashes_only: bool,
 }
@@ -139,7 +139,7 @@ pub struct GetTransactionArgs {
     #[arg(value_name = "TX_HASH")]
     tx_hash: TxHash,
 
-    /// Get only the transaction status instead of full transaction
+    /// Get only the transaction status instead of full transaction [starknet_getTransactionStatus]
     #[arg(long)]
     status: bool,
 }

@@ -7,17 +7,17 @@ use super::client::Client;
 #[derive(Debug, Subcommand)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum TxpoolCommands {
-    /// Get pending and queued transaction counts
+    /// Get pending and queued transaction counts [txpool_status]
     Status,
 
-    /// Get all transactions in the pool, grouped by sender and nonce
+    /// Get all transactions in the pool, grouped by sender and nonce [txpool_content]
     Content,
 
-    /// Get pool contents filtered by sender address
+    /// Get pool contents filtered by sender address [txpool_contentFrom]
     #[command(name = "content-from")]
     ContentFrom(AddressArgs),
 
-    /// Get a human-readable summary of the pool
+    /// Get a human-readable summary of the pool [txpool_inspect]
     Inspect,
 }
 

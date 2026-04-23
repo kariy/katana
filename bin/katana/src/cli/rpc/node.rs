@@ -6,7 +6,7 @@ use super::client::Client;
 #[derive(Debug, Subcommand)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum NodeCommands {
-    /// Get node identity and build information
+    /// Get node identity and build information [node_getInfo]
     Info,
 }
 

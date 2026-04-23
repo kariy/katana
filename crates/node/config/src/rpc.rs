@@ -166,8 +166,7 @@ impl Default for RpcModulesList {
 
 impl std::fmt::Display for RpcModulesList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names: Vec<String> =
-            self.0.iter().map(|m| m.to_string().to_lowercase()).collect();
+        let mut names: Vec<String> = self.0.iter().map(|m| m.to_string().to_lowercase()).collect();
         names.sort();
         f.write_str(&names.join(","))
     }

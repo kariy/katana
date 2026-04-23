@@ -7,11 +7,11 @@ use super::client::Client;
 #[derive(Debug, Subcommand)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum TeeCommands {
-    /// Generate a TEE attestation quote for a block's state
+    /// Generate a TEE attestation quote for a block's state [tee_generateQuote]
     #[command(name = "generate-quote")]
     GenerateQuote(GenerateQuoteArgs),
 
-    /// Get the Merkle inclusion proof for an event
+    /// Get the Merkle inclusion proof for an event [tee_getEventProof]
     #[command(name = "event-proof")]
     EventProof(EventProofArgs),
 }
