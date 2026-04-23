@@ -126,7 +126,7 @@ Example:
 
 ```sh
 # Start Katana with comma-separated CLI args
-printf 'start --http.addr,0.0.0.0,--http.port,5050,--tee.provider,sev-snp\n' \
+printf 'start --http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp\n' \
   | socat - UNIX-CONNECT:/tmp/katana-control.sock
 
 # Check launcher status
@@ -145,7 +145,7 @@ sudo ./misc/AMDSEV/start-vm.sh
 sudo ./misc/AMDSEV/start-vm.sh /path/to/boot-components
 
 # Or customize Katana runtime flags (comma-separated)
-sudo ./misc/AMDSEV/start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee.provider,sev-snp,--dev"
+sudo ./misc/AMDSEV/start-vm.sh --katana-args "--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp,--dev"
 ```
 
 The script:

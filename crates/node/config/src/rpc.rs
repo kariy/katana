@@ -36,7 +36,6 @@ pub enum RpcModuleKind {
     TxPool,
     Node,
     Cartridge,
-    Tee,
 }
 
 /// Configuration for the RPC server.
@@ -109,7 +108,6 @@ impl RpcModulesList {
             RpcModuleKind::TxPool,
             RpcModuleKind::Node,
             RpcModuleKind::Cartridge,
-            RpcModuleKind::Tee,
         ]))
     }
 

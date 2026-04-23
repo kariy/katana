@@ -119,7 +119,7 @@ wait_for_control_channel() {
 }
 
 start_katana_via_control_channel() {
-    local start_cmd="start --http.addr,0.0.0.0,--http.port,${VM_RPC_PORT},--tee.provider,sev-snp"
+    local start_cmd="start --http.addr,0.0.0.0,--http.port,${VM_RPC_PORT},--tee,sev-snp"
     local response=""
 
     for ((elapsed = 1; elapsed <= BOOT_TIMEOUT; elapsed++)); do

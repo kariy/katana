@@ -347,7 +347,7 @@ Look at how existing APIs are registered in `crates/node/sequencer/src/lib.rs`:
 
 - **Always-on, simple**: DevApi (lines 324–327) — conditional on `RpcModuleKind::Dev`.
 - **Always-on, multi-trait**: StarknetApi (lines 309–322) — registers read, write, trace, and katana traits from the same handler.
-- **Feature-gated**: TeeApi (lines 330–358) — guarded by `#[cfg(feature = "tee")]` and `RpcModuleKind::Tee`, with provider initialization logic.
+- **Feature-gated**: TeeApi (lines 330–358) — guarded by `#[cfg(feature = "tee")]` and gated on `config.tee` being set (enabled via the `--tee <PROVIDER>` CLI flag rather than an `RpcModuleKind` variant), with provider initialization logic.
 
 ---
 

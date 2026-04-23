@@ -373,35 +373,33 @@ where
         };
 
         // --- build tee api (if configured)
-        if config.rpc.apis.contains(&RpcModuleKind::Tee) {
-            if let Some(ref tee_config) = config.tee {
-                use katana_tee::{TeeProvider, TeeProviderType};
+        if let Some(ref tee_config) = config.tee {
+            use katana_tee::{TeeProvider, TeeProviderType};
 
-                let tee_provider: Arc<dyn TeeProvider> = match tee_config.provider_type {
-                    TeeProviderType::SevSnp => {
-                        #[cfg(feature = "tee-snp")]
-                        {
-                            Arc::new(
-                                katana_tee::SevSnpProvider::new()
-                                    .context("Failed to initialize SEV-SNP provider")?,
-                            )
-                        }
-                        #[cfg(not(feature = "tee-snp"))]
-                        {
-                            anyhow::bail!(
-                                "SEV-SNP TEE provider requires the 'tee-snp' feature to be enabled"
-                            );
-                        }
+            let tee_provider: Arc<dyn TeeProvider> = match tee_config.provider_type {
+                TeeProviderType::SevSnp => {
+                    #[cfg(feature = "tee-snp")]
+                    {
+                        Arc::new(
+                            katana_tee::SevSnpProvider::new()
+                                .context("Failed to initialize SEV-SNP provider")?,
+                        )
                     }
-                    #[cfg(feature = "tee-mock")]
-                    TeeProviderType::Mock => Arc::new(katana_tee::MockProvider::new()),
-                };
+                    #[cfg(not(feature = "tee-snp"))]
+                    {
+                        anyhow::bail!(
+                            "SEV-SNP TEE provider requires the 'tee-snp' feature to be enabled"
+                        );
+                    }
+                }
+                #[cfg(feature = "tee-mock")]
+                TeeProviderType::Mock => Arc::new(katana_tee::MockProvider::new()),
+            };
 
-                let api = TeeApi::new(provider.clone(), tee_provider, tee_config.fork_block_number);
-                rpc_modules.merge(TeeApiServer::into_rpc(api))?;
+            let api = TeeApi::new(provider.clone(), tee_provider, tee_config.fork_block_number);
+            rpc_modules.merge(TeeApiServer::into_rpc(api))?;
 
-                info!(target: "node", provider = ?tee_config.provider_type, "TEE API enabled");
-            }
+            info!(target: "node", provider = ?tee_config.provider_type, "TEE API enabled");
         }
 
         // --- build rpc middleware

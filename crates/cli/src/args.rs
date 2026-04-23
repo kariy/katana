@@ -430,13 +430,6 @@ impl SequencerNodeArgs {
                 modules.add(RpcModuleKind::Cartridge);
             }
 
-            // The TEE rpc must be enabled if a TEE provider is specified.
-            // We put it here so that even when the individual api are explicitly specified
-            // (ie `--rpc.api`) we guarantee that the tee rpc is enabled.
-            if self.tee.tee_provider.is_some() {
-                modules.add(RpcModuleKind::Tee);
-            }
-
             let cors_origins = self.server.http_cors_origins.clone();
 
             Ok(RpcConfig {
@@ -721,7 +714,7 @@ impl SequencerNodeArgs {
 
     fn tee_config(&self) -> Option<TeeConfig> {
         self.tee
-            .tee_provider
+            .provider
             .map(|provider_type| TeeConfig { provider_type, fork_block_number: None })
     }
 

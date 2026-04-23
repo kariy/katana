@@ -58,7 +58,7 @@ usage() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOT_DIR="${SCRIPT_DIR}/output/qemu"
-KATANA_ARGS_CSV="--http.addr,0.0.0.0,--http.port,5050,--tee.provider,sev-snp"
+KATANA_ARGS_CSV="--http.addr,0.0.0.0,--http.port,5050,--tee,sev-snp"
 AUTO_START_KATANA=1
 
 while [[ $# -gt 0 ]]; do
