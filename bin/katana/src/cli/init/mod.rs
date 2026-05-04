@@ -395,6 +395,7 @@ SETTLEMENT LAYER
                     contract,
                     &settlement_provider,
                     effective_fact_registry,
+                    self.tee,
                 )
                 .await
                 .with_context(|| "settlement contract validation failed.".to_string())
@@ -426,6 +427,7 @@ SETTLEMENT LAYER
                     account,
                     chain_id,
                     effective_fact_registry,
+                    self.tee,
                 )
                 .await
                 .with_context(|| "failed to deploy settlement contract".to_string())
