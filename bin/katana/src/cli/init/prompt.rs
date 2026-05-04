@@ -5,6 +5,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use inquire::validator::{ErrorMessage, Validation};
 use inquire::{Confirm, CustomType, Select};
+use katana_chain_spec::settlement_check::SettlementChainProvider;
 use katana_primitives::block::BlockNumber;
 use katana_primitives::cairo::ShortString;
 use katana_primitives::{ContractAddress, Felt};
@@ -16,7 +17,6 @@ use tokio::runtime::Handle;
 
 use super::{deployment, PersistentOutcome, ProofImpl, SovereignOutcome};
 use crate::cli::init::deployment::DeploymentOutcome;
-use crate::cli::init::settlement::SettlementChainProvider;
 use crate::cli::init::slot::{self, PaymasterAccountArgs};
 
 pub async fn prompt_rollup() -> Result<PersistentOutcome> {
