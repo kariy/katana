@@ -20,3 +20,33 @@ BUSYBOX_PKG_SHA256="944b2728f53ceb3916cec2c962873c9951e612408099601751db2a0a5d81
 # Kernel modules extra (Ubuntu package, for initrd SEV-SNP support)
 KERNEL_MODULES_EXTRA_PKG_VERSION="6.8.0-90.91"
 KERNEL_MODULES_EXTRA_PKG_SHA256="c17bd76779ce68a076dc1ef9b1669947f35f1868f6736dbd0a8a7ccacf7571f3"
+
+# Kernel modules main (Ubuntu package, for initrd dm-crypt / dm-integrity).
+# Used only by the canonical sealed-storage build.
+KERNEL_MODULES_PKG_VERSION="6.8.0-90.91"
+KERNEL_MODULES_PKG_SHA256="466b8912637defb01f8c37191a36afebbf0589eac9395cebff8d33cc269155a7"
+
+# cryptsetup source (kernel.org tarball, built statically inside a pinned
+# Alpine container during the canonical sealed-storage build).
+CRYPTSETUP_VERSION="2.7.5"
+CRYPTSETUP_SHA256="d2be4395b8f503b0ebf4b2d81db90c35a97050a358ee21fe62a0dfb66e5d5522"
+
+# LVM2 source. Alpine ships only a shared libdevmapper.so; we need a static
+# libdevmapper.a to link cryptsetup with `-all-static`, so we build the
+# device-mapper subset of LVM2 from source inside the same container.
+# Version pinned to match the lvm2 package version in CRYPTSETUP_BUILDER_IMAGE
+# (currently 2.03.23-r3) so headers/ABI line up. Bump alongside Alpine.
+LVM2_VERSION="2.03.23"
+LVM2_SHA256="74e794a9e9dee1bcf8a2065f65b9196c44fdf321e22d63b98ed7de8c9aa17a5d"
+
+# e2fsprogs source. Ubuntu's busybox-static does not include `mkfs.ext2`,
+# and Alpine's e2fsprogs-static ships only static libraries (no binaries).
+# Build a static `mke2fs` from upstream source inside the same container
+# and ship it as /bin/mkfs.ext2 in the initrd; the unseal flow uses it to
+# format the decrypted mapper on first boot.
+E2FSPROGS_VERSION="1.47.0"
+E2FSPROGS_SHA256="144af53f2bbd921cef6f8bea88bb9faddca865da3fbc657cc9b4d2001097d5db"
+
+# Container image used to build static cryptsetup. Pinned by sha256 digest so
+# the build matches across hosts. Bump when upgrading Alpine.
+CRYPTSETUP_BUILDER_IMAGE="alpine@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a"

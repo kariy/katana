@@ -16,6 +16,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export OVMF_GIT_URL OVMF_BRANCH OVMF_COMMIT KERNEL_VERSION
 export KERNEL_PKG_SHA256 BUSYBOX_PKG_SHA256 KERNEL_MODULES_EXTRA_PKG_SHA256
 export BUSYBOX_PKG_VERSION KERNEL_MODULES_EXTRA_PKG_VERSION
+# Sealed-storage build pins. KERNEL_MODULES_* is consumed by build-initrd.sh;
+# CRYPTSETUP_*, LVM2_*, E2FSPROGS_*, CRYPTSETUP_BUILDER_IMAGE are consumed by
+# build-cryptsetup.sh (auto-invoked below when CRYPTSETUP_BINARY/MKFS_EXT2_BINARY
+# aren't already supplied). All required unless KATANA_UNSEALED_BUILD=1.
+export KERNEL_MODULES_PKG_VERSION KERNEL_MODULES_PKG_SHA256
+export CRYPTSETUP_VERSION CRYPTSETUP_SHA256 CRYPTSETUP_BUILDER_IMAGE
+export LVM2_VERSION LVM2_SHA256
+export E2FSPROGS_VERSION E2FSPROGS_SHA256
 
 # Set SOURCE_DATE_EPOCH if not already set (for reproducible builds)
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
@@ -37,13 +45,24 @@ function usage()
 	echo ""
 	echo "OPTIONS:"
 	echo "  --install PATH          Installation path (default: ${SCRIPT_DIR}/output/qemu)"
-	echo "  --katana PATH           Path to katana binary (optional, will build if not provided)"
+	echo "  --katana PATH           Path to katana binary (optional; auto-built if not provided)"
+	echo "  --snp-derivekey PATH    Path to snp-derivekey binary (optional; auto-built if not"
+	echo "                          provided). Required for sealed-mode initrd unless"
+	echo "                          KATANA_UNSEALED_BUILD=1 is set."
+	echo "  --cryptsetup PATH       Path to a static cryptsetup binary (optional; auto-built"
+	echo "                          via build-cryptsetup.sh if not provided). Required for"
+	echo "                          sealed-mode initrd."
+	echo "  --mkfs-ext2 PATH        Path to a static mkfs.ext2 binary (optional; auto-built"
+	echo "                          via build-cryptsetup.sh if not provided). Required for"
+	echo "                          sealed-mode initrd."
 	echo "  -h|--help               Usage information"
 	echo ""
 	echo "COMPONENTS (if none specified, builds all):"
 	echo "  ovmf                    Build OVMF firmware"
 	echo "  kernel                  Build kernel"
-	echo "  initrd                  Build initrd (builds katana if --katana not provided)"
+	echo "  initrd                  Build initrd (auto-builds katana, snp-derivekey, and"
+	echo "                          cryptsetup + mkfs.ext2 if their --... flags / *_BINARY"
+	echo "                          env vars are not set)"
 
 	exit 1
 }
@@ -64,6 +83,26 @@ while [ -n "$1" ]; do
 	--katana)
 		[ -z "$2" ] && usage
 		KATANA_BINARY="$2"
+		shift; shift
+		;;
+	--snp-derivekey)
+		[ -z "$2" ] && usage
+		# Must export so build-initrd.sh (a child process) sees the path.
+		# The auto-build branch below already exports; this is for the
+		# `--snp-derivekey PATH` short-circuit case.
+		export SNP_DERIVEKEY_BINARY="$2"
+		shift; shift
+		;;
+	--cryptsetup)
+		[ -z "$2" ] && usage
+		# Same export rationale as --snp-derivekey: build-initrd.sh runs
+		# as a child process and reads CRYPTSETUP_BINARY from the env.
+		export CRYPTSETUP_BINARY="$2"
+		shift; shift
+		;;
+	--mkfs-ext2)
+		[ -z "$2" ] && usage
+		export MKFS_EXT2_BINARY="$2"
 		shift; shift
 		;;
 	-h|--help)
@@ -120,6 +159,23 @@ if [ $BUILD_INITRD -eq 1 ] && [ -z "$KATANA_BINARY" ]; then
 	esac
 
 	PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+	if ! command -v cargo >/dev/null 2>&1; then
+		echo ""
+		echo "ERROR: cargo is not on PATH."
+		echo ""
+		echo "If you are running build.sh under sudo, cargo is likely installed under your"
+		echo "regular user (\$HOME/.cargo/bin) but not in root's PATH. Two options:"
+		echo ""
+		echo "  1. Pre-build katana as your normal user, then pass the path:"
+		echo "       ${PROJECT_ROOT}/scripts/build-musl.sh"
+		echo "       sudo $0 --katana \\"
+		echo "         ${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/performance/katana ..."
+		echo ""
+		echo "  2. Run build.sh with sudo -E to inherit your PATH (assumes cargo on it)."
+		echo ""
+		echo "If cargo is genuinely not installed, set it up via rustup: https://rustup.rs"
+		exit 1
+	fi
 	"${PROJECT_ROOT}/scripts/build-musl.sh"
 	if [ $? -ne 0 ]; then
 		echo "Katana build failed"
@@ -131,6 +187,88 @@ if [ $BUILD_INITRD -eq 1 ] && [ -z "$KATANA_BINARY" ]; then
 		exit 1
 	fi
 	echo "Using built katana: $KATANA_BINARY"
+fi
+
+# Build snp-derivekey for the canonical sealed initrd unless the operator
+# opted out (KATANA_UNSEALED_BUILD=1) or pre-supplied a binary path. Mirrors
+# the auto-katana flow above; reuses the workspace's musl target so it ships
+# with no runtime libc dependency.
+if [ $BUILD_INITRD -eq 1 ] \
+   && [ "${KATANA_UNSEALED_BUILD:-0}" -ne 1 ] \
+   && [ -z "${SNP_DERIVEKEY_BINARY:-}" ]; then
+	PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+	SNP_DERIVEKEY_BINARY="${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/performance/snp-derivekey"
+	if [ ! -x "$SNP_DERIVEKEY_BINARY" ]; then
+		if ! command -v cargo >/dev/null 2>&1; then
+			echo ""
+			echo "ERROR: snp-derivekey not found at $SNP_DERIVEKEY_BINARY and cargo is not on PATH."
+			echo ""
+			echo "If you are running build.sh under sudo, cargo is likely installed under your"
+			echo "regular user (\$HOME/.cargo/bin) but not in root's PATH. Two options:"
+			echo ""
+			echo "  1. Pre-build snp-derivekey as your normal user, then pass the path:"
+			echo "       cargo build --target x86_64-unknown-linux-musl --profile performance \\"
+			echo "         -p katana-tee --features snp --bin snp-derivekey"
+			echo "       sudo $0 --katana <path> --snp-derivekey \\"
+			echo "         $SNP_DERIVEKEY_BINARY ..."
+			echo ""
+			echo "  2. Run build.sh with sudo -E to inherit your PATH (assumes cargo on it)."
+			exit 1
+		fi
+		echo ""
+		echo "Building snp-derivekey with musl (sealed-storage helper)..."
+		( cd "$PROJECT_ROOT" && \
+		  cargo build \
+		    --locked \
+		    --target x86_64-unknown-linux-musl \
+		    --profile performance \
+		    -p katana-tee --features snp \
+		    --bin snp-derivekey ) || {
+			echo "snp-derivekey build failed"
+			exit 1
+		}
+	fi
+	if [ ! -x "$SNP_DERIVEKEY_BINARY" ]; then
+		echo "ERROR: snp-derivekey binary missing at $SNP_DERIVEKEY_BINARY"
+		exit 1
+	fi
+	export SNP_DERIVEKEY_BINARY
+	echo "Using snp-derivekey: $SNP_DERIVEKEY_BINARY"
+fi
+
+# Build static cryptsetup + mkfs.ext2 for the canonical sealed initrd unless
+# the operator opted out (KATANA_UNSEALED_BUILD=1) or pre-supplied both
+# binary paths. The container build is non-trivial (~2-3 minutes the first
+# time apk-add fetches its mirror), so we cache outputs under
+# $PROJECT_ROOT/target/cryptsetup-static and skip when both binaries are
+# already present.
+if [ $BUILD_INITRD -eq 1 ] \
+   && [ "${KATANA_UNSEALED_BUILD:-0}" -ne 1 ] \
+   && { [ -z "${CRYPTSETUP_BINARY:-}" ] || [ -z "${MKFS_EXT2_BINARY:-}" ]; }; then
+	PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+	CRYPTSETUP_OUT_DIR="${PROJECT_ROOT}/target/cryptsetup-static"
+	CRYPTSETUP_BINARY="${CRYPTSETUP_BINARY:-${CRYPTSETUP_OUT_DIR}/cryptsetup}"
+	MKFS_EXT2_BINARY="${MKFS_EXT2_BINARY:-${CRYPTSETUP_OUT_DIR}/mkfs.ext2}"
+
+	if [ ! -x "$CRYPTSETUP_BINARY" ] || [ ! -x "$MKFS_EXT2_BINARY" ]; then
+		echo ""
+		echo "Building static cryptsetup + mkfs.ext2 (sealed-storage helpers)..."
+		"${SCRIPT_DIR}/build-cryptsetup.sh" "$CRYPTSETUP_OUT_DIR" || {
+			echo "build-cryptsetup.sh failed"
+			exit 1
+		}
+	fi
+	if [ ! -x "$CRYPTSETUP_BINARY" ]; then
+		echo "ERROR: cryptsetup binary missing at $CRYPTSETUP_BINARY"
+		exit 1
+	fi
+	if [ ! -x "$MKFS_EXT2_BINARY" ]; then
+		echo "ERROR: mkfs.ext2 binary missing at $MKFS_EXT2_BINARY"
+		exit 1
+	fi
+	export CRYPTSETUP_BINARY MKFS_EXT2_BINARY
+	echo "Using cryptsetup: $CRYPTSETUP_BINARY"
+	echo "Using mkfs.ext2:  $MKFS_EXT2_BINARY"
 fi
 
 mkdir -p $INSTALL_DIR
