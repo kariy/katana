@@ -203,6 +203,12 @@ jobs:
           # See: https://github.com/jemalloc/jemalloc/issues/467
           echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
 
+      # katana-grpc's build script invokes tonic-build, which requires protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build binary
         if: ${{ matrix.job.native_build == false }}
         shell: bash
