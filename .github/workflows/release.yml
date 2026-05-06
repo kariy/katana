@@ -380,6 +380,9 @@ jobs:
           target: ${{ matrix.job.target }}
           cache-on-failure: true
           cache-key: sidecar-${{ matrix.job.target }}
+          # Building third-party crates; don't fail their builds on rustc
+          # warnings (default is `-D warnings`).
+          rustflags: ""
 
       - name: Read sidecar versions
         id: sidecar_versions
