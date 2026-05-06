@@ -50,6 +50,8 @@ jobs:
       image: ghcr.io/dojoengine/katana-dev:latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Build contracts
         run: make contracts
