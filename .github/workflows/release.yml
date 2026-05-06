@@ -385,9 +385,9 @@ jobs:
         run: |
           # Parse the sidecar-versions.toml for the current sidecar
           SIDECAR="${{ matrix.sidecar }}"
-          REPO=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'repo' | sed 's/.*= *"\(.*\)"/\1/')
-          REV=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'rev' | sed 's/.*= *"\(.*\)"/\1/')
-          PACKAGE=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'package' | sed 's/.*= *"\(.*\)"/\1/')
+          REPO=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'repo' | sed 's/.*= *"\(.*\)".*/\1/')
+          REV=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'rev' | sed 's/.*= *"\(.*\)".*/\1/')
+          PACKAGE=$(grep -A3 "\[${SIDECAR}\]" sidecar-versions.toml | grep 'package' | sed 's/.*= *"\(.*\)".*/\1/')
           echo "repo=${REPO}" >> $GITHUB_OUTPUT
           echo "rev=${REV}" >> $GITHUB_OUTPUT
           echo "package=${PACKAGE}" >> $GITHUB_OUTPUT
