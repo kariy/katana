@@ -73,6 +73,7 @@ jobs:
       ARCH: ${{ matrix.job.arch }}
       NATIVE_BUILD: ${{ matrix.job.native_build }}
     strategy:
+      fail-fast: false
       matrix:
         job:
           # The OS is used for the runner
@@ -213,7 +214,18 @@ jobs:
         if: ${{ matrix.job.native_build == false }}
         shell: bash
         run: |
-          cargo build -p katana --bin katana --profile performance --target ${{ matrix.job.target }}
+          # tee-snp pulls in sev-snp -> openssl (vendored), which fails on
+          # Windows because openssl-src needs a perl with Locale::Maketext::Simple
+          # that the runner's msys2 perl lacks. SEV-SNP is Linux-only AMD tech
+          # anyway, so disable it for Windows.
+          if [[ "$PLATFORM_NAME" == "win32" ]]; then
+            cargo build -p katana --bin katana \
+              --no-default-features \
+              --features client,init-custom-settlement-chain,init-slot,jemalloc,katana-cli/explorer,katana-cli/grpc,katana-cli/server \
+              --profile performance --target ${{ matrix.job.target }}
+          else
+            cargo build -p katana --bin katana --profile performance --target ${{ matrix.job.target }}
+          fi
 
       - name: Build binary ( w/ cairo-native )
         if: ${{ matrix.job.native_build == true }}
@@ -356,6 +368,7 @@ jobs:
       PLATFORM_NAME: ${{ matrix.job.platform }}
       ARCH: ${{ matrix.job.arch }}
     strategy:
+      fail-fast: false
       matrix:
         sidecar: [paymaster-service, vrf-server]
         job:

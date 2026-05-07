@@ -72,3 +72,7 @@ COPY --from=build /katana /katana
 COPY --from=build /katana.build-info /katana.build-info
 COPY --from=build /katana.sha256 /katana.sha256
 COPY --from=build /katana.sha384 /katana.sha384
+
+# `docker create` (used by build-reproducible-katana.sh to extract files via
+# `docker cp`) requires a command. The container is never started.
+CMD ["/katana"]
