@@ -67,6 +67,7 @@ default = [
 	"init-slot",
 	"jemalloc",
 	"katana-cli/explorer",
+	"katana-cli/tee-snp",
 ]
 
 client = [ "dep:colored_json", "dep:serde_json" ]
