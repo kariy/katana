@@ -45,6 +45,7 @@ use katana_rpc_api::paymaster::PaymasterApiServer;
 use katana_rpc_api::starknet::StarknetApiServer;
 #[cfg(feature = "explorer")]
 use katana_rpc_api::starknet_ext::StarknetApiExtServer;
+#[cfg(any(feature = "tee-snp", feature = "tee-mock"))]
 use katana_rpc_api::tee::TeeApiServer;
 use katana_rpc_server::cartridge::{CartridgeApi, CartridgeConfig};
 use katana_rpc_server::dev::DevApi;
@@ -55,6 +56,7 @@ use katana_rpc_server::middleware::metrics::RpcServerMetricsLayer;
 use katana_rpc_server::node::NodeApi;
 use katana_rpc_server::paymaster::PaymasterProxy;
 use katana_rpc_server::starknet::{RpcCache, StarknetApi, StarknetApiConfig};
+#[cfg(any(feature = "tee-snp", feature = "tee-mock"))]
 use katana_rpc_server::tee::TeeApi;
 use katana_rpc_server::{RpcServer, RpcServerHandle, RpcServiceBuilder};
 use katana_rpc_types::node::NodeInfo;
@@ -375,43 +377,55 @@ where
 
         // --- build tee api (if configured)
         if let Some(ref tee_config) = config.tee {
-            use katana_tee::{TeeProvider, TeeProviderType};
+            #[cfg(not(any(feature = "tee-snp", feature = "tee-mock")))]
+            {
+                let _ = tee_config;
+                anyhow::bail!(
+                    "TEE configuration provided but no TEE provider feature is compiled in \
+                     (enable 'tee-snp' or 'tee-mock')"
+                );
+            }
 
-            let tee_provider: Arc<dyn TeeProvider> = match tee_config.provider_type {
-                TeeProviderType::SevSnp => {
-                    #[cfg(feature = "tee-snp")]
-                    {
-                        Arc::new(
-                            katana_tee::SevSnpProvider::new()
-                                .context("Failed to initialize SEV-SNP provider")?,
-                        )
+            #[cfg(any(feature = "tee-snp", feature = "tee-mock"))]
+            {
+                use katana_tee::{TeeProvider, TeeProviderType};
+
+                let tee_provider: Arc<dyn TeeProvider> = match tee_config.provider_type {
+                    TeeProviderType::SevSnp => {
+                        #[cfg(feature = "tee-snp")]
+                        {
+                            Arc::new(
+                                katana_tee::SevSnpProvider::new()
+                                    .context("Failed to initialize SEV-SNP provider")?,
+                            )
+                        }
+                        #[cfg(not(feature = "tee-snp"))]
+                        {
+                            anyhow::bail!(
+                                "SEV-SNP TEE provider requires the 'tee-snp' feature to be enabled"
+                            );
+                        }
                     }
-                    #[cfg(not(feature = "tee-snp"))]
-                    {
-                        anyhow::bail!(
-                            "SEV-SNP TEE provider requires the 'tee-snp' feature to be enabled"
-                        );
-                    }
-                }
-                #[cfg(feature = "tee-mock")]
-                TeeProviderType::Mock => Arc::new(katana_tee::MockProvider::new()),
-                // The `Mock` variant on `TeeProviderType` is gated on
-                // `feature = "tee-mock"` in `katana-tee`, but cargo features
-                // unify across the workspace — so the variant can be visible
-                // here even when this crate's own `tee-mock` feature is off.
-                #[allow(unreachable_patterns)]
-                _ => anyhow::bail!("Mock TEE provider requires the 'tee-mock' feature"),
-            };
+                    #[cfg(feature = "tee-mock")]
+                    TeeProviderType::Mock => Arc::new(katana_tee::MockProvider::new()),
+                    // The `Mock` variant on `TeeProviderType` is gated on
+                    // `feature = "tee-mock"` in `katana-tee`, but cargo features
+                    // unify across the workspace — so the variant can be visible
+                    // here even when this crate's own `tee-mock` feature is off.
+                    #[allow(unreachable_patterns)]
+                    _ => anyhow::bail!("Mock TEE provider requires the 'tee-mock' feature"),
+                };
 
-            let api = TeeApi::new(
-                provider.clone(),
-                tee_provider,
-                tee_config.fork_block_number,
-                &backend.chain_spec,
-            );
-            rpc_modules.merge(TeeApiServer::into_rpc(api))?;
+                let api = TeeApi::new(
+                    provider.clone(),
+                    tee_provider,
+                    tee_config.fork_block_number,
+                    &backend.chain_spec,
+                );
+                rpc_modules.merge(TeeApiServer::into_rpc(api))?;
 
-            info!(target: "node", provider = ?tee_config.provider_type, "TEE API enabled");
+                info!(target: "node", provider = ?tee_config.provider_type, "TEE API enabled");
+            }
         }
 
         // --- build rpc middleware
