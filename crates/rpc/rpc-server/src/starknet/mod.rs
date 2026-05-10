@@ -963,6 +963,26 @@ where
         let from = self.resolve_event_block_id_if_forked(from_block)?;
         let to = self.resolve_event_block_id_if_forked(to_block)?;
 
+        // On a forked chain, clamp `from_block` up to the fork point. Pre-fork events live on
+        // the upstream chain and would otherwise force the provider to fetch every pre-fork
+        // block sequentially from the upstream RPC (e.g. ~9.6M blocks for a mainnet fork),
+        // which can hang the handler for hours. Callers that need pre-fork events should query
+        // the upstream RPC directly.
+        //
+        // NOTE: only `from` is clamped. `to` is left alone — if it's also pre-fork the
+        // resulting range `clamp(from)..=to` will be empty and `events_inner` will naturally
+        // return an empty page. Clamping `to` upward would change query semantics.
+        let from = match from {
+            EventBlockId::Num(num) => {
+                if let Some(fork_point) = provider.fork_point()? {
+                    EventBlockId::Num(num.max(fork_point))
+                } else {
+                    EventBlockId::Num(num)
+                }
+            }
+            EventBlockId::Pending => EventBlockId::Pending,
+        };
+
         // reserved buffer to fill up with events to avoid reallocations
         let mut events = Vec::with_capacity(chunk_size as usize);
         let filter = utils::events::Filter { address, keys: keys.clone() };

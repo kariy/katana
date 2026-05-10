@@ -217,6 +217,10 @@ impl<Tx1: DbTx> BlockNumberProvider for ForkedProvider<Tx1> {
         };
         Ok(local_latest.max(self.block_id()))
     }
+
+    fn fork_point(&self) -> ProviderResult<Option<BlockNumber>> {
+        Ok(Some(self.block_id()))
+    }
 }
 
 impl<Tx1: DbTx> BlockIdReader for ForkedProvider<Tx1> {}

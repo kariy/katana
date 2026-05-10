@@ -78,6 +78,19 @@ pub trait BlockNumberProvider: Send + Sync {
             BlockHashOrNumber::Hash(hash) => self.block_number_by_hash(hash),
         }
     }
+
+    /// Returns the fork point block number if this provider is backed by a forked upstream
+    /// chain.
+    ///
+    /// Returns `Some(N)` only for forked providers where `N` is the upstream block number this
+    /// fork inherits state from. Returns `None` for non-forked providers.
+    ///
+    /// Callers can use this to avoid pathological work on the fork's pre-fork range. For example
+    /// the JSON-RPC `getEvents` handler clamps `from_block` upward to the fork point so it does
+    /// not walk millions of pre-fork blocks one at a time fetching each from upstream.
+    fn fork_point(&self) -> ProviderResult<Option<BlockNumber>> {
+        Ok(None)
+    }
 }
 
 #[auto_impl::auto_impl(&, Box, Arc)]
